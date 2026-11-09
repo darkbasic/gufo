@@ -1691,7 +1691,10 @@ speculative mode and memory. `rss_mib` is process resident memory;
 and must not be added together.
 With disk caching enabled, `phase=artifact_identity` identifies full-file
 SHA-256 work. Digests are cached against the open file's identity, size and
-modification/change timestamps; unchanged artifacts avoid another scan.
+modification/change timestamps. Only scans begun outside the timestamp
+ambiguity window qualify for reuse; stable artifacts then avoid another scan.
+See the [GGUF identity cache](gguf-identity.md) for record migration, filesystem
+and clock assumptions, and CPU regression commands.
 Startup qualification measures process launch through first prefill and first
 token, including work deferred until the first request.
 
