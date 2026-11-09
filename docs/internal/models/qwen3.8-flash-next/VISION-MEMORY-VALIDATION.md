@@ -5,12 +5,35 @@ candidate. **Hardware capacity, performance and numerical image correctness
 remain unverified until these checks run.** CPU tests of the accounting and
 simulated allocations do not establish a physical-memory or numerical pass.
 
-This procedure creates a separate process, loopback port and disposable cache.
+The harness starts its own process on a separate loopback port with a disposable cache.
 It never downloads weights, changes kernel parameters, clears another cache or
-stops another service. The existing deployment stays running; if its residency
-leaves insufficient memory for this second model, retain the refusal and arrange
-a separate owner-controlled validation window. Do not lower context, sessions,
-cache capacity, MTP settings or quantization to turn a refusal into a pass.
+stops another service. **Before loading the candidate on the ZBook, arrange an
+owner-controlled maintenance window and unload the production Flash-Next chat.**
+Do not load a second Flash-Next beside the running production chat. Do not lower
+context, sessions, cache capacity, MTP settings or quantization to turn a refusal
+into a pass.
+
+## Owner-controlled maintenance window
+
+Before starting the harness or any model-dependent check, the owner must:
+
+1. Record the production service state and the auxiliary services included in
+   the target memory budget, together with their memory use.
+2. Drain production chat requests, stop its model-serving process using the
+   normal operational procedure, and verify its model memory has been released.
+   Keep the required auxiliary services running with their normal configuration;
+   stopping them would invalidate the target memory-budget test.
+3. Leave production model files, configuration, launcher and checkpoint caches
+   untouched. Use only the candidate binary, separate port and newly created
+   disposable cache specified below.
+4. After all candidate processes exit, restore production chat using the normal
+   operational procedure and verify service health. Retain the validation
+   evidence and disposable cache for review.
+
+The harness cannot arrange this window or verify the deployment's service list.
+It must not stop or restart services itself; its cleanup terminates only the
+candidate child it started. If the window is unavailable, keep hardware
+execution pending. Building the candidate does not require loading weights.
 
 ## Build and record inputs
 
@@ -29,7 +52,10 @@ The CPU tests compile production DeviceInput lifecycle and HIP cache-backing
 sources against simulated HIP providers. They do not validate hipBLAS or the
 real allocator. The Flash-Next runner/engine/executor and Qwen encoder/injection
 kernels still require the GPU build, which also compiles the cache-backing
-sources against the real HIP headers and runtime.
+sources against the real HIP headers and runtime. **The real HIP release build
+is pending:** the development VM has no suitable ROCm/HIP toolchain. Run the
+release configure/build commands above in a capable environment; CPU and
+fake-HIP passes do not establish GPU compilation or four-session memory fit.
 
 Set your existing paths; the first model shard finds its siblings. The two
 sidecars may live anywhere. Use a new result directory for every attempt.
@@ -87,14 +113,27 @@ The harness requires all of the following:
   accepted client connections or four queued requests alone do not pass.
 - A small synthetic image succeeds. Its checkpoint is published to the owned
   disk cache, and reuse after four other active histories reports the RAM tier.
-- Five synthetic 4096 × 4096 images exceed the 4 GiB image budget while fitting
-  the context limit. A request asking for streaming receives HTTP 503 with
-  `resource_exhausted` before SSE. A following text request succeeds.
+- A separate mixed phase maps two text requests and one image-bearing request
+  to distinct `/slots` task IDs and observes all three advancing together,
+  including image decoding after a cold image prefix. Progress only through
+  the text before the image cannot satisfy this check.
+  The fourth execution slot stays available for an oversized image request;
+  this does not replace the four-text-session capacity check above.
+- While those mixed tasks remain active, five synthetic 4096 × 4096 images
+  exceed the 4 GiB image budget while fitting the context limit. The oversized
+  streaming request receives HTTP 503 with `resource_exhausted` before SSE.
+  The same mixed task IDs must remain active and advance after the refusal,
+  all three responses must succeed, and subsequent text work must succeed.
+  Sequential image/text success, task reassignment, or requests merely queued
+  behind occupied slots do not qualify. Early completion without the required
+  overlap fails the evidence check; retain that attempt.
 - After restart, the image request reports a disk hit and reused tokens. Its
   greedy continuation matches the RAM result; a following text request succeeds.
 
-Inspect `report.json`, each request's response, both server logs and
-`samples.jsonl`/`restart-samples.jsonl`. The samples retain `/slots`, `/metrics`,
+Inspect `report.json`, each request's response, both server logs,
+`mixed-samples.jsonl` and `samples.jsonl`/`restart-samples.jsonl`. The mixed
+samples retain the direct task-attribution and progress observations around
+the refusal. The background samples retain `/slots`, `/metrics`,
 host available RAM/swap, process RSS/high-water RSS/swap, and any Linux DRM
 VRAM/GTT usage files available. Missing DRM readings mean device peaks are
 unmeasured; use the installed AMD monitoring tool to capture those peaks while

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -35,9 +36,18 @@ void Refused(Function&& function) {
 }  // namespace
 
 namespace fake {
+enum class AllocationKind { kDynamic, kTextBaseDescriptor };
+struct Allocation {
+  std::size_t bytes;
+  std::shared_ptr<vision::AdmissionBudget> owner;
+  AllocationKind kind;
+};
 std::mutex mutex;
-std::unordered_map<void*, std::size_t> allocations;
-std::weak_ptr<vision::AdmissionBudget> budget;
+std::unordered_map<void*, Allocation> allocations;
+std::unordered_map<std::shared_ptr<vision::AdmissionBudget>, std::size_t> peaks;
+// Binding selects the owner only at allocation. Every allocation remembers
+// that owner for later checks/frees, even on a different thread or binding.
+thread_local std::weak_ptr<vision::AdmissionBudget> budget;
 std::atomic<std::size_t> encodes{0};
 // Fail one selected API call after n successful calls of the same kind.
 thread_local std::optional<std::size_t> fail_malloc, fail_copy, fail_sync;
@@ -55,28 +65,64 @@ bool Fail(std::optional<std::size_t>& remaining) {
 std::size_t Bytes() {
   const std::lock_guard lock(mutex);
   std::size_t bytes = 0;
-  for (const auto& [pointer, count] : allocations)
-    bytes += count;
+  for (const auto& [pointer, allocation] : allocations)
+    bytes += allocation.bytes;
   return bytes;
 }
-void CheckClaim(std::size_t bytes) {
-  if (bytes == sizeof(vision::DeviceRope))
-    return;  // Stable descriptor belongs to the base text-session claim.
-  if (const auto owner = budget.lock())
-    Require(owner->Outstanding() >= bytes,
-            "physical allocation/release must remain covered by its claim");
+// Caller holds mutex, including through allocation registration/removal, so
+// simultaneous allocations cannot both inspect the same old aggregate.
+std::size_t LiveBytes(const std::shared_ptr<vision::AdmissionBudget>& owner,
+                      AllocationKind kind) {
+  std::size_t bytes = 0;
+  for (const auto& [pointer, allocation] : allocations)
+    if (allocation.owner == owner && allocation.kind == kind)
+      bytes = vision::CheckedAdd(bytes, allocation.bytes);
+  return bytes;
+}
+void CheckClaim(const std::shared_ptr<vision::AdmissionBudget>& owner,
+                std::size_t additional = 0) {
+  if (owner)
+    Require(owner->Outstanding() >=
+                vision::CheckedAdd(LiveBytes(owner, AllocationKind::kDynamic),
+                                   additional),
+            "aggregate live dynamic allocations exceed owning budget claim");
+}
+std::size_t DynamicBytes(
+    const std::shared_ptr<vision::AdmissionBudget>& owner) {
+  const std::lock_guard lock(mutex);
+  return LiveBytes(owner, AllocationKind::kDynamic);
+}
+std::size_t DescriptorBytes(
+    const std::shared_ptr<vision::AdmissionBudget>& owner) {
+  const std::lock_guard lock(mutex);
+  return LiveBytes(owner, AllocationKind::kTextBaseDescriptor);
+}
+std::size_t PeakBytes(const std::shared_ptr<vision::AdmissionBudget>& owner) {
+  const std::lock_guard lock(mutex);
+  return peaks[owner];
+}
+hipError_t Allocate(void** pointer, std::size_t bytes, AllocationKind kind) {
+  if (Fail(fail_malloc))
+    return hipErrorMemoryAllocation;
+  const auto owner = budget.lock();
+  const std::lock_guard lock(mutex);
+  CheckClaim(owner, kind == AllocationKind::kDynamic ? bytes : 0);
+  auto storage = std::make_unique<std::byte[]>(bytes);
+  allocations.emplace(storage.get(), Allocation{bytes, owner, kind});
+  peaks[owner] =
+      std::max(peaks[owner], LiveBytes(owner, AllocationKind::kDynamic));
+  *pointer = storage.release();
+  return hipSuccess;
 }
 }  // namespace fake
 
 hipError_t hipMalloc(void** pointer, std::size_t bytes) {
-  if (fake::Fail(fake::fail_malloc))
-    return hipErrorMemoryAllocation;
-  fake::CheckClaim(bytes);
-  auto storage = std::make_unique<std::byte[]>(bytes);
-  const std::lock_guard lock(fake::mutex);
-  fake::allocations.emplace(storage.get(), bytes);
-  *pointer = storage.release();
-  return hipSuccess;
+  return fake::Allocate(pointer, bytes, fake::AllocationKind::kDynamic);
+}
+hipError_t hipMalloc(vision::DeviceRope** pointer, std::size_t bytes) {
+  Require(bytes == sizeof(vision::DeviceRope), "invalid descriptor size");
+  return fake::Allocate(reinterpret_cast<void**>(pointer), bytes,
+                        fake::AllocationKind::kTextBaseDescriptor);
 }
 hipError_t hipFree(void* pointer) {
   if (!pointer)
@@ -84,7 +130,9 @@ hipError_t hipFree(void* pointer) {
   const std::lock_guard lock(fake::mutex);
   const auto found = fake::allocations.find(pointer);
   Require(found != fake::allocations.end(), "double or unowned device free");
-  fake::CheckClaim(found->second);
+  // Validate before removal, not after: releasing a reservation while buffers
+  // remain live must fail even when this free would bring usage below it.
+  fake::CheckClaim(found->second.owner);
   delete[] static_cast<std::byte*>(pointer);
   fake::allocations.erase(found);
   return hipSuccess;
@@ -103,6 +151,36 @@ const char* hipGetErrorString(hipError_t error) {
   return error == hipErrorMemoryAllocation ? "injected allocation failure"
                                            : "injected copy/sync failure";
 }
+
+namespace fake {
+struct DeviceStorage {
+  explicit DeviceStorage(std::size_t bytes) {
+    if (hipMalloc(&data, bytes) != hipSuccess)
+      throw std::bad_alloc();
+  }
+  ~DeviceStorage() { (void)hipFree(data); }
+  DeviceStorage(const DeviceStorage&) = delete;
+  DeviceStorage& operator=(const DeviceStorage&) = delete;
+  void* data{nullptr};
+};
+
+// Independent fixture for the encoder's explicit allocation lifetimes. Small
+// 32/64-pixel inputs keep real storage below 1 MiB. These simulate scratch and
+// output coexistence; they do not compile or execute the real HIP encoder.
+std::array<std::size_t, 9> EncoderScratchSizes(const gufo::core::Image& image) {
+  const std::size_t patches = (image.width / 16) * (image.height / 16);
+  const auto tile = std::min<std::size_t>(patches, patches == 4096 ? 64 : 128);
+  return {image.pixels.size(),     patches * 1152 * 4,      patches * 4304 * 4,
+          patches * 4304 * 2,      patches * 3 * 1152 * 2,  patches * 1152 * 2,
+          16 * tile * patches * 4, 16 * tile * patches * 2, tile * 1152 * 4};
+}
+std::size_t EncoderScratchBytes(const gufo::core::Image& image) {
+  std::size_t bytes = 0;
+  for (const auto size : EncoderScratchSizes(image))
+    bytes += size;
+  return bytes;
+}
+}  // namespace fake
 
 namespace gufo::models::qwen::vision {
 // The real DeviceInput .cpp, including Inject's ownership loop, is compiled
@@ -125,6 +203,15 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
   ++fake::encodes;
   if (cancelled && cancelled())
     throw std::runtime_error("injected encoder cancellation");
+  std::vector<std::unique_ptr<fake::DeviceStorage>> scratch;
+  for (const auto bytes : fake::EncoderScratchSizes(image))
+    scratch.push_back(std::make_unique<fake::DeviceStorage>(bytes));
+  {
+    // Pinned upload uses the same unified-memory budget but ends before the
+    // output embedding is allocated. All nine device scratch buffers survive.
+    fake::DeviceStorage pinned(
+        std::min<std::size_t>(image.pixels.size(), 16U << 20));
+  }
   auto result = std::shared_ptr<Embedding>(new Embedding);
   result->rows_ = image.width / 32 * (image.height / 32);
   result->width_ = impl_->width;
@@ -183,6 +270,54 @@ void EmptyDescriptor(const vision::DeviceInput& input) {
           "text transition releases every dynamic device buffer");
 }
 
+void AggregateCoverageRegression() {
+  auto owner = std::make_shared<vision::AdmissionBudget>(128);
+  auto other = std::make_shared<vision::AdmissionBudget>(1024);
+  fake::budget = owner;
+  auto claim = owner->Reserve(96);
+  void* first = nullptr;
+  void* replacement = nullptr;
+  Require(hipMalloc(&first, 64) == hipSuccess, "initial dynamic allocation");
+  // Each 64-byte allocation fits the 96-byte claim by itself. Both together
+  // do not: this is the regression the old one-allocation check missed.
+  Refused([&] { (void)hipMalloc(&replacement, 64); });
+  Require(!replacement && fake::DynamicBytes(owner) == 64,
+          "aggregate undercoverage refuses replacement before allocation");
+  auto growth = owner->Reserve(32);
+  Require(hipMalloc(&replacement, 64) == hipSuccess &&
+              fake::PeakBytes(owner) == 128,
+          "funded replacement includes old and new allocations at the peak");
+  // Allocation ownership survives rebinding; another pool's empty claim must
+  // not invalidate the original pool's frees.
+  fake::budget = other;
+  (void)hipFree(first);
+  (void)hipFree(replacement);
+  auto other_claim = other->Reserve(1024);
+  fake::budget = owner;
+  claim = {};
+  growth = {};
+  vision::DeviceRope* descriptor = nullptr;
+  Require(hipMalloc(&descriptor, sizeof(*descriptor)) == hipSuccess,
+          "typed stable descriptor is funded by text base with no image claim");
+  Require(fake::DescriptorBytes(owner) == sizeof(*descriptor) &&
+              !fake::DynamicBytes(owner),
+          "descriptor and dynamic allocation totals are explicitly separate");
+  Refused([&] { (void)hipMalloc(&first, sizeof(*descriptor)); });
+  Require(!fake::DynamicBytes(owner),
+          "descriptor-sized dynamic allocation cannot borrow another pool");
+  auto exact = owner->Reserve(sizeof(*descriptor));
+  Require(hipMalloc(&first, sizeof(*descriptor)) == hipSuccess,
+          "descriptor-sized dynamic allocation requires its own budget");
+  exact = {};
+  Refused([&] { (void)hipFree(first); });
+  Require(fake::DynamicBytes(owner) == sizeof(*descriptor),
+          "premature reservation release is caught before physical free");
+  exact = owner->Reserve(sizeof(*descriptor));
+  (void)hipFree(first);
+  (void)hipFree(descriptor);
+  Require(!fake::Bytes(), "negative coverage checks clean up every allocation");
+}
+
 void RetentionAndTextTransitions() {
   const auto prompt = Prompt();
   auto budget = std::make_shared<vision::AdmissionBudget>(Peak(*prompt));
@@ -192,11 +327,18 @@ void RetentionAndTextTransitions() {
     vision::DeviceInput input;
     input.SetMemoryAdmission(budget);
     input.PrepareRope(nullptr);
+    Require(fake::DescriptorBytes(budget) == sizeof(vision::DeviceRope) &&
+                !fake::DynamicBytes(budget) && !budget->Outstanding(),
+            "text descriptor remains outside the image pool");
     const auto* descriptor = input.rope();
     input.Configure(prompt, encoder, nullptr);
     Require(budget->Outstanding() == Peak(*prompt),
             "complete prepared request reserved before position allocation");
     Inject(input, 2);
+    Require(fake::PeakBytes(budget) ==
+                input.Bytes() - sizeof(vision::DeviceRope) +
+                    fake::EncoderScratchBytes(*prompt->images[0].pixels),
+            "encoder scratch and output coexist with live position storage");
     const auto encodes = fake::encodes.load();
     const auto bytes = input.Bytes();
     input.Configure(prompt, encoder, nullptr);
@@ -241,10 +383,19 @@ void GrowthAndRestoredHistory() {
     input.Configure(small, encoder, nullptr);
     Inject(input, 2);
     const auto initial = budget->Outstanding();
+    const auto old_dynamic = fake::DynamicBytes(budget);
     input.Configure(large, encoder, nullptr);
+    Require(budget->Outstanding() == Peak(*large) + old_dynamic +
+                                         small->images[0].pixels->pixels.size(),
+            "replacement reserves new work plus every retained old buffer");
     Inject(input, 2, 4);
     Require(budget->Outstanding() > initial,
             "growth charges replacement peak before releasing old buffers");
+    Require(
+        fake::PeakBytes(budget) ==
+            fake::DynamicBytes(budget) +
+                fake::EncoderScratchBytes(*large->images[0].pixels),
+        "grown encoder scratch coexists with replacement output and positions");
     const auto* rope = input.rope();
     Require(
         rope->prefix_length == 6 && rope->delta == -2 &&
@@ -279,6 +430,32 @@ void GrowthAndRestoredHistory() {
   }
   Require(!fake::Bytes() && !budget->Outstanding(),
           "restored sessions leave neither allocations nor reservations");
+
+  // Two history images retain the first output while the second is encoded.
+  // The last encoding peak therefore contains positions, BOTH embeddings and
+  // transient scratch, rather than only the largest individual allocation.
+  const auto history = Prompt();
+  const vision::ImageGrid second_grid{3, 1, 1};
+  history->images.push_back({history->images.front().pixels, second_grid, {}});
+  history->rope.images.push_back(second_grid);
+  {
+    auto history_budget =
+        std::make_shared<vision::AdmissionBudget>(Peak(*history));
+    fake::budget = history_budget;
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(history_budget);
+    input.Configure(history, encoder, nullptr);
+    Inject(input, 2, 2);
+    Require(fake::PeakBytes(history_budget) ==
+                fake::DynamicBytes(history_budget) +
+                    fake::EncoderScratchBytes(*history->images[0].pixels),
+            "image history retains both embeddings during transient encoding");
+    input.Configure(nullptr, encoder, nullptr);
+    Require(
+        !history_budget->Outstanding() && !fake::DynamicBytes(history_budget),
+        "history reset releases aggregate dynamic state and its claim");
+  }
+  Require(!fake::Bytes(), "history descriptor cleanup");
 }
 
 void AllocationAndCopyFailures() {
@@ -310,14 +487,17 @@ void AllocationAndCopyFailures() {
     Require(!fake::Bytes() && !budget->Outstanding(),
             "failed stage does not corrupt the following image request");
   }
-  for (const bool after_allocation : {false, true}) {
+  // Fail before scratch, partway through it, at pinned upload, at output, and
+  // after output allocation. Every partial working set stays covered until
+  // its individual allocations are really released during unwinding.
+  for (const unsigned stage : {0U, 4U, 9U, 10U, 11U}) {
     vision::DeviceInput input;
     input.SetMemoryAdmission(budget);
     input.Configure(prompt, encoder, nullptr);
-    if (after_allocation)
+    if (stage == 11)
       fake::fail_encode_after_allocation = true;
     else
-      fake::fail_malloc = 0;
+      fake::fail_malloc = stage;
     Refused<std::bad_alloc>([&] { Inject(input, 2); });
     Require(budget->Outstanding() == Peak(*prompt),
             "encoder failure cannot release a live position claim");
@@ -363,6 +543,7 @@ void ConcurrentInputs() {
   std::latch attempted(2), release(1);
   std::atomic<unsigned> admitted{0}, refused{0};
   auto request = [&] {
+    fake::budget = budget;
     vision::DeviceInput input;
     input.SetMemoryAdmission(budget);
     start.arrive_and_wait();
@@ -391,6 +572,7 @@ void ConcurrentInputs() {
 
 int main() {
   gufo::server::Logger::SetLevel(gufo::server::LogLevel::kError);
+  AggregateCoverageRegression();
   RetentionAndTextTransitions();
   GrowthAndRestoredHistory();
   AllocationAndCopyFailures();

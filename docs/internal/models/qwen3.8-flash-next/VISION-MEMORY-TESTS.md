@@ -7,7 +7,44 @@ The [accounting analysis](VISION-MEMORY.md) and
 [owner-run GPU procedure](VISION-MEMORY-VALIDATION.md) describe the remaining
 physical-capacity, performance and numerical checks.
 
-## Results
+## Validation review follow-up
+
+As of November 9, 2026, the focused review started from a clean tree at
+`e45e0d79932455c1ff6ea3178d82a217d22e70ed`. It changed tests and validation
+instructions only; admission policy and target settings are unchanged.
+
+The simulated allocator now checks aggregate simultaneously live dynamic bytes
+per owning budget, separately from typed stable descriptors. Negative cases
+detect individually fitting allocations whose sum exceeds the reservation,
+cross-budget borrowing, descriptor-sized dynamic allocations and premature
+release. Encoder fixtures include scratch, pinned upload, retained embeddings
+and replacement peaks, with failures injected at each stage.
+
+The hardware harness now requires a cold image request and two text requests
+to advance together under mapped scheduler task IDs, including image decoding.
+After an oversized image refusal, the same tasks must advance again and finish
+successfully before text recovery can pass. CPU tests validate this evidence
+logic and orchestration; they do not execute the mixed workload on hardware.
+
+| Follow-up check | Result |
+| --- | --- |
+| Rebuild `qwen_vision_lifecycle_test` with `cpu-test` | Passed |
+| Six focused CTest cases listed below | 6/6 passed; 4.43 seconds wall time |
+| Hardware-harness CPU evidence/orchestration tests | 21/21 passed; 0.002 seconds |
+| Targeted lifecycle ASan/UBSan with leak detection | Passed; 0.033 seconds, no diagnostics |
+| Python compilation and harness `--help` | Passed |
+| Changed C++ formatting, documentation and `git diff --check` | Passed |
+
+The sanitizer command and results are retained in
+`/tmp/gufo-vision-lifecycle-review-sanitizers.log`. It instruments the lifecycle
+test, production DeviceInput, admission and ledger sources; other libraries
+remain the prebuilt CPU dependencies. The full CPU build and 114-test PR gate
+below are earlier implementation results, not reruns for this focused review.
+No suitable ROCm/HIP toolchain is installed here: the real HIP release build
+and all hardware execution remain pending under the
+[owner-controlled maintenance procedure](VISION-MEMORY-VALIDATION.md).
+
+## Initial implementation results
 
 | Check | Result |
 | --- | --- |

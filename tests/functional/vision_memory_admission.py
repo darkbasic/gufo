@@ -130,6 +130,113 @@ def concurrent_progress(samples):
     raise RuntimeError("no evidence of four execution sessions advancing concurrently; queued requests do not qualify")
 
 
+def active_tasks(sample):
+    """Read scheduler identities, never HTTP connection or response identities."""
+    slots = sample.get("slots")
+    require(isinstance(slots, list) and len(slots) == 4,
+            "mixed phase requires four observable execution sessions")
+    active = [slot for slot in slots if slot.get("is_processing")]
+    tasks = {slot["id_task"]: slot for slot in active}
+    require(len(tasks) == len(active) and all(task > 0 for task in tasks),
+            "mixed phase saw invalid or duplicate scheduler task IDs")
+    return tasks
+
+
+def mixed_progress(samples, task_ids, image_task):
+    """All mapped tasks must advance in one uninterrupted observed overlap."""
+    expected = set(task_ids)
+    require(len(expected) == 3, "mixed phase requires two text tasks and one image task")
+    require(image_task in expected, "mixed image task must have an observed scheduler identity")
+    first, previous, advanced = None, None, set()
+    for sample in samples:
+        tasks = active_tasks(sample)
+        require(expected <= tasks.keys(),
+                "mixed tasks ended or were reassigned before overlap evidence completed")
+        progress = {task: (tasks[task]["n_prompt_tokens_processed"],
+                           tasks[task]["next_token"][0]["n_decoded"])
+                    for task in expected}
+        if first is None:
+            first, first_time = progress, sample["time"]
+        else:
+            for task in expected:
+                require(all(now >= prior for now, prior in zip(progress[task], previous[task])),
+                        "mixed task progress counters moved backwards")
+                if any(now > start for now, start in zip(progress[task], first[task])):
+                    advanced.add(task)
+            # Prefilling only the text before the image is insufficient. A
+            # decoded token proves this task consumed its image-bearing prefix
+            # while both text peers still occupy their execution sessions.
+            if advanced == expected and progress[image_task][1] > 0:
+                return {"start_time": first_time, "sample_time": sample["time"],
+                        "before": first, "after": progress}
+        previous = progress
+    return None
+
+
+def run_mixed_phase(chat, observe, text_bodies, image_body, oversized, recovery,
+                    timeout, evidence, pause=time.sleep):
+    """Keep a fourth slot free for refusal while three mapped tasks execute."""
+    require(len(text_bodies) == 2, "mixed phase needs exactly two text peers")
+    require(not active_tasks(observe()), "mixed phase must start with idle execution sessions")
+    workers = ThreadPoolExecutor(max_workers=3)
+    futures, identities = {}, {}
+    evidence["task_ids"] = identities
+    deadline = time.monotonic() + timeout
+
+    def poll():
+        require(time.monotonic() < deadline, "mixed phase timed out without execution evidence")
+        for label, future in futures.items():
+            if future.done():
+                future.result()  # Preserve an actual HTTP failure if there was one.
+                raise RuntimeError(f"{label} completed too early for mixed execution evidence")
+        return observe()
+
+    def wait_progress():
+        def observations():
+            while True:
+                yield poll()
+                pause(0.2)
+        return mixed_progress(observations(), identities.values(), identities["mixed-image"])
+
+    try:
+        # Submit exactly one unassigned request at a time on this isolated
+        # server. The sole newly active task is therefore that request. No
+        # response ID or task-number ordering is assumed to identify images.
+        for label, body in [(f"mixed-text-{i}", body) for i, body in enumerate(text_bodies)] + [
+                ("mixed-image", image_body)]:
+            futures[label] = workers.submit(chat, label, body)
+            while True:
+                tasks = active_tasks(poll())
+                require(set(identities.values()) <= tasks.keys(),
+                        "a mapped mixed task ended before its peers were admitted")
+                added = tasks.keys() - identities.values()
+                require(len(added) <= 1, "cannot attribute new scheduler task to the mixed request")
+                if added:
+                    identities[label] = added.pop()
+                    break
+                pause(0.2)
+        evidence["before_refusal"] = wait_progress()
+        # No fifth-request queue is involved: two text peers and the image
+        # leave the fourth execution slot available for this oversized image.
+        evidence["refusal_started"] = time.time()
+        refusal = chat("oversized-image", oversized, 503)
+        evidence["refusal_finished"] = time.time()
+        require(refusal["error"]["code"] == "resource_exhausted",
+                "oversized image did not produce an explicit resource refusal")
+        # The same three task IDs must still be held, and every one must make
+        # further progress AFTER the refusal, including the successful image.
+        evidence["after_refusal"] = wait_progress()
+        for future in futures.values():
+            future.result(timeout=max(0, deadline - time.monotonic()))
+        chat("text-after-refusal", recovery)
+        evidence["status"] = "passed"
+    except BaseException as error:
+        evidence.update(status="failed", failure=str(error))
+        raise
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
+
+
 def parallel(function, values):
     workers = ThreadPoolExecutor(max_workers=4)
     try:
@@ -272,9 +379,31 @@ def main():
                          "messages": [{"role": "user", "content": [
                              {"type": "image_url", "image_url": {"url": png_url(4096, (i * 40, 0, 0)), "detail": "high"}}
                              for i in range(5)]}]}
-            refusal = chat("oversized-image", oversized, 503)
-            require(refusal["error"]["code"] == "resource_exhausted", "oversized image did not produce an explicit resource refusal")
-            chat("text-after-refusal", text_body("recovery", 1, 32))
+            mixed_image = text_body("mixed-image", 512, args.max_tokens)
+            mixed_image["cache_prompt"] = False  # Exercise a fresh image prefix.
+            mixed_image["messages"][-1]["content"] = [
+                {"type": "text", "text": mixed_image["messages"][-1]["content"]
+                 + " Begin by naming the image's dominant color, then continue the detailed numbered checks."},
+                {"type": "image_url", "image_url": {"url": png_url(32, (0, 0, 255)), "detail": "high"}}]
+            # Keep the exact attribution/overlap/refusal observations alongside
+            # the background memory samples, including evidence on failure.
+            with (output / "mixed-samples.jsonl").open("w") as mixed_samples:
+                def observe_mixed():
+                    started = time.time()
+                    response = request(args.port, "/slots", timeout=10)
+                    require(response["status"] == 200, "mixed phase could not inspect execution sessions")
+                    sample = {"poll_started": started, "time": time.time(),
+                              "slots": response["response"]}
+                    mixed_samples.write(json.dumps(sample) + "\n")
+                    mixed_samples.flush()
+                    return sample
+
+                report["mixed_workload"] = {"status": "running"}
+                run_mixed_phase(
+                    chat, observe_mixed,
+                    [text_body(f"mixed-text-{i}", 512, args.max_tokens) for i in range(2)],
+                    mixed_image, oversized, text_body("recovery", 1, 32),
+                    args.timeout, report["mixed_workload"])
         # The context manager stops only the child it started and drains disk
         # publication. Restart with the same owned cache, model and parameters.
         restarted_log = output / "server-restarted.log"
