@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/host_allocations.hpp"
 #include "src/core/hip/transfer_pool.hpp"
+#include "src/core/resource_error.hpp"
 
 namespace gufo::hip {
 
@@ -55,6 +57,14 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
           " bytes is too small for its backing; use a larger "
           "--cache-ram-bytes, or --cache-ram-bytes off");
     const auto& allocation = plan.front();
+    if (allocation.block_bytes &&
+        allocation.blocks >
+            std::numeric_limits<std::size_t>::max() / allocation.block_bytes)
+      throw std::invalid_argument("RAM cache backing plan overflows");
+    const auto payload_bytes = allocation.blocks * allocation.block_bytes;
+    if (allocation.metadata_bytes >
+        std::numeric_limits<std::size_t>::max() - payload_bytes)
+      throw std::invalid_argument("RAM cache backing plan overflows");
     // Pages commit as captures need them. A payload cannot span segments,
     // so segments of about 128 MiB bound registration pauses and stranded
     // edge space, fitting at least two of the largest payloads. Prefill
@@ -91,9 +101,8 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
     backing->pool = std::make_unique<hip::CommittedBackingPool>(
         ledger,
         hip::BackingPoolConfig{
-            allocation.blocks * allocation.block_bytes +
-                allocation.metadata_bytes,
-            allocation.block_bytes, allocation.metadata_bytes, segment,
+            payload_bytes + allocation.metadata_bytes, allocation.block_bytes,
+            allocation.metadata_bytes, segment,
             [limited, refuse, hooks](std::size_t bytes) {
               const std::lock_guard lock(limited->mutex);
               if (limited->active &&
@@ -137,11 +146,25 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
     // Prepare a bounded reserve before readiness. The first shared-prefix
     // capture needs more than one segment; preparing 2 GiB avoids moving
     // registration onto that request's capture or decode path.
-    backing->pool->GrowAhead(2ULL << 30);
+    // A provider may promise the entire cache budget beside another reserved
+    // execution pool. Commit its payload now so later requests cannot turn
+    // that grant into a smaller effective cache through failed lazy growth.
+    backing->pool->GrowAhead(hooks.require_full_backing ? payload_bytes
+                                                        : 2ULL << 30);
     backing->pool->WaitForGrowth();
+    if (hooks.require_full_backing &&
+        backing->pool->CommittedBytes() < payload_bytes)
+      throw core::ResourceAdmissionError(
+          "RAM cache backing commitment refused: reason=capacity_or_allocation "
+          "required_payload_bytes=" +
+          std::to_string(payload_bytes) + " committed_bytes=" +
+          std::to_string(backing->pool->CommittedBytes()));
     hooks.info(
         "schema=component-cache-v1 event=backing_prepared committed_bytes=" +
         std::to_string(backing->pool->CommittedBytes()) +
+        (hooks.require_full_backing
+             ? " required_payload_bytes=" + std::to_string(payload_bytes)
+             : "") +
         " long_term_pinned_bytes=" +
         std::to_string(backing->pool->LongTermPinnedBytes()));
   };

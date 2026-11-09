@@ -26,6 +26,10 @@ struct ComponentCacheHooks {
   // exhausted pool. Acquisition does not wait for other users and can fail.
   // Must be nonzero.
   std::size_t transfer_streams{64};
+  // Commit every payload page before readiness. Refuse startup when host or
+  // device headroom, registration or allocation cannot back the full plan.
+  // False preserves bounded startup preparation and lazy growth.
+  bool require_full_backing{false};
 };
 
 // HIP component-cache backing for any adapter: pinned committed pages, a

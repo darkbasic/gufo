@@ -34,6 +34,17 @@
   ],
   "options": [
     {
+      "name": "--vision-memory-bytes",
+      "type": "integer",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "Shared request-aware vision memory budget in bytes; 0 keeps conservative per-session admission (default)"
+    },
+    {
       "name": "--mtp-model",
       "type": "path",
       "commands": [

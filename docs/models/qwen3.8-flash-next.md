@@ -79,6 +79,24 @@ Gufo finds `mmproj-BF16.gguf` next to the target; pass `--mmproj PATH` to use
 another location. Images work the same way as for
 [Qwen3.8 27B](qwen3.8-27b.md#images), with AR and MTP.
 
+Serving reserves worst-case image state for every session by default. For
+mostly text traffic, add `--vision-memory-bytes 4294967296` to `gufo serve llm`
+to use one shared 4 GiB image budget. Text sessions retain their full context
+and MTP state; prepared image requests reserve their additional memory before
+device allocation. Requests exceeding the shared budget return HTTP 503
+`resource_exhausted`. The projector remains loaded.
+
+The budget includes image history, position buffers and encoder work. Retained
+image buffers keep their reservation until released; a text transition releases
+them. Concurrent image requests can therefore be refused even if each fits
+alone. An explicit RAM checkpoint-cache budget must still be granted in full.
+Other providers keep their own admission policy. Omit the option or use
+`--vision-memory-bytes 0` to select conservative admission. A deployment launcher
+must forward this option to the native `serve llm` command.
+
+Hardware capacity and numerical image correctness require the separate
+[GPU validation procedure](../internal/models/qwen3.8-flash-next/VISION-MEMORY-VALIDATION.md).
+
 ## Performance
 
 As of October 18, 2026, on Strix Halo:

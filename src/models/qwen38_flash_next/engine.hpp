@@ -26,6 +26,10 @@ namespace gufo::core {
 class GgufReader;
 }
 
+namespace gufo::models::qwen::vision {
+class AdmissionBudget;
+}
+
 namespace gufo::models::qwen38_flash_next {
 
 struct ModelWeights;
@@ -106,6 +110,16 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// Text state including the stable vision descriptor, without lazy image
+  /// payloads. Only serving with a separately reserved vision budget may use
+  /// this for admission; snapshots and other callers retain SessionBytes.
+  [[nodiscard]] std::size_t TextSessionBytes(
+      core::SessionMode mode, std::uint32_t context) const noexcept;
+  /// Serving initialization only: prepared prompts must carry their host
+  /// preparation reservation, and cache backing must commit before execution.
+  void SetVisionMemoryBudget(
+      std::shared_ptr<qwen::vision::AdmissionBudget> budget,
+      std::size_t snapshot_protected_bytes);
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   /// Caps wide copy verification (Executor::LimitCopyRows); call before any
   /// session is created.

@@ -3,6 +3,7 @@
 set(gufo_pr_targets
   cache_adapter_test
   cache_adapter_lifecycle_test
+  cache_full_backing_test
   cache_ledger_test
   cache_checkpoint_test
   cache_prefix_index_test
@@ -21,6 +22,7 @@ set(gufo_pr_targets
   http_request_test multipart_test
   heap_placement_test
   admission_memory_test
+  qwen_vision_admission_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test platform_library_test
   logit_sampler_test ggml_dequant_test
@@ -44,6 +46,9 @@ set(gufo_pr_targets
   qwen_image_21_test qwen_image_21_weights_test qwen_tokenizer_test video_api_test
   # END GENERATED MODEL PR TARGETS
 )
+if (NOT ENGINE_ENABLE_HIP)
+  list(APPEND gufo_pr_targets qwen_vision_lifecycle_test)
+endif()
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests text_cli_dispatch_test)
 list(APPEND gufo_pr_tests text_cli_dispatch_prompt text_cli_dispatch_chat text_cli_dispatch_bench)

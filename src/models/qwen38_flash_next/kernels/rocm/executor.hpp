@@ -222,6 +222,7 @@ private:
   std::function<bool()> is_cancelled_;
   std::vector<float*> rollback_allocations_;
   std::uint32_t rollback_depth_{0};
+  std::uint32_t rollback_floor_{0};
   void TrimRollback(std::uint32_t depth) noexcept;
   mutable std::shared_ptr<SnapshotRegistry> snapshots_;
   mutable std::shared_ptr<const SnapshotLineage> snapshot_lineage_;
@@ -295,6 +296,12 @@ public:
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Configure before any sessions or snapshots exist. Private snapshot
+  /// storage must leave the shared vision pool free. Serving commits its full
+  /// host cache before execution, so those pages need no second reservation.
+  void SetVisionMemoryBudget(
+      std::shared_ptr<qwen::vision::AdmissionBudget> budget,
+      std::size_t snapshot_protected_bytes);
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
   /// Commits checkpoint slot 0 on first use. False when the device lacks
@@ -711,6 +718,8 @@ private:
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
   Options options_;
+  std::shared_ptr<qwen::vision::AdmissionBudget> vision_memory_budget_;
+  std::size_t vision_snapshot_reserve_{0};
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;

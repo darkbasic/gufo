@@ -19,6 +19,20 @@ if (ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;gfx1151;cache" TIMEOUT 60)
 endif()
 target_link_libraries(gufo_cache_fake PUBLIC gufo_cache)
+
+# Compile production host-side HIP backing logic against synchronous CPU
+# registration/stream stubs. No HIP SDK, device or large allocations are used.
+add_executable(cache_full_backing_test full_backing_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/hip/component_cache_resources.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/hip/committed_backing.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/hip/host_allocations.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/hip/transfer_pool.cpp)
+target_include_directories(cache_full_backing_test BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/fake_hip)
+target_link_libraries(cache_full_backing_test PRIVATE gufo_cache_fake)
+add_test(NAME cache_full_backing_test COMMAND cache_full_backing_test)
+set_tests_properties(cache_full_backing_test PROPERTIES LABELS "cpu;cache;admission" TIMEOUT 30)
+
 add_executable(cache_adapter_lifecycle_test lifecycle_test.cpp)
 target_link_libraries(cache_adapter_lifecycle_test PRIVATE gufo_cache_fake)
 add_test(NAME cache_adapter_lifecycle_test COMMAND cache_adapter_lifecycle_test)

@@ -12,6 +12,7 @@
 #include <exception>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
+#include <gufo/ext/host_budget.hpp>
 #include <gufo/ext/platform/pages.hpp>
 #include <limits>
 #include <memory>
@@ -186,7 +187,8 @@ public:
   static constexpr std::size_t kSpareBlocks = 2;
 
   /// `reserve` is the device memory every commit leaves free.
-  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
+  explicit SnapshotAllocator(std::uint64_t reserve, bool protect_host = false)
+      : reserve_(reserve), protect_host_(protect_host) {
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -249,7 +251,13 @@ public:
     std::size_t total = 0;
     if (hipMemGetInfo(&free, &total) != hipSuccess)
       return false;
-    return free >= bytes && free - bytes + reserved >= reserve_;
+    // Prepared images and pinned cache pages share physical RAM with this
+    // device on an APU, but need not consume the same reported HIP heap.
+    // Optional snapshot copies must respect the host partition as well.
+    if (protect_host_)
+      free = std::min(free, ext::HostSnapshotCeilingBytes());
+    return free >= bytes &&
+           (reserved >= reserve_ || free - bytes >= reserve_ - reserved);
   }
   /// A transfer on a stream of its own, reused across transfers: creating a
   /// stream can stall for milliseconds, and a shared stream would make a
@@ -312,6 +320,7 @@ private:
     (void)hipStreamSynchronize(stream_);
   }
   std::uint64_t reserve_;
+  bool protect_host_;
   std::mutex mutex_;
   std::vector<void*> spares_;
   std::uint64_t spare_bytes_{0};
@@ -325,9 +334,22 @@ std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
     // Admission reserved the lazy scratch; snapshots must not consume it.
     snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
-        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
+        qwen::vision::CheckedAdd(
+            qwen::vision::CheckedAdd(DeferredScratchBytes(),
+                                     kSnapshotDeviceSlackBytes),
+            vision_snapshot_reserve_),
+        bool(vision_memory_budget_));
   });
   return snapshot_allocator_;
+}
+
+void Executor::SetVisionMemoryBudget(
+    std::shared_ptr<qwen::vision::AdmissionBudget> budget,
+    std::size_t snapshot_protected_bytes) {
+  if (snapshot_allocator_ || vision_memory_budget_)
+    throw std::logic_error("vision admission must precede session execution");
+  vision_memory_budget_ = std::move(budget);
+  vision_snapshot_reserve_ = snapshot_protected_bytes;
 }
 
 // Provenance describes rows actually copied by a restore, rather than token
@@ -673,6 +695,7 @@ Session::~Session() {
     std::lock_guard lock(snapshots_->mutex);
     snapshots_->failure = std::current_exception();
   }
+  rollback_floor_ = 0;
   TrimRollback(0);
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
@@ -880,6 +903,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
 }
 
 void Session::TrimRollback(std::uint32_t depth) noexcept {
+  depth = std::max(depth, rollback_floor_);
   if (depth >= rollback_depth_)
     return;
   // Keep graphs whose rows still exist. Deeper verifier graphs capture
@@ -1389,6 +1413,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                                                  std::string* error_msg) const {
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
+  s->vision_input_.SetMemoryAdmission(vision_memory_budget_);
   s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
   if (s->mtp_enabled_ && !has_mtp()) {
     AssignError(error_msg, "MTP session requires a loaded predictor");
@@ -1491,6 +1516,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
        !AppendDraftRows(*s, 0, model_->draft_specials(), error_msg) ||
        !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
     return nullptr;
+  }
+  // Request-aware admission promises the complete text/MTP state. Commit
+  // its rollback rows before snapshots or image work can use the remainder;
+  // they are part of SessionBytes, not the shared lazy-scratch allowance.
+  if (vision_memory_budget_ && s->mtp_enabled_) {
+    if (!EnsureRollback(*s, options_.max_speculative - 1, error_msg))
+      return nullptr;
+    s->rollback_floor_ = options_.max_speculative - 1;
   }
   return s;
 }
