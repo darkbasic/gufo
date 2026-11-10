@@ -57,7 +57,14 @@ public:
 
 private:
   void ReserveRequest(const Prompt* prompt, const Encoder* encoder,
-                      std::size_t prefix_rows, bool replacement);
+                      std::size_t prefix_rows, bool replacement,
+                      bool reuse_embeddings, bool layout_work);
+  [[nodiscard]] std::size_t OnDemandBytes(const Prompt* prompt,
+                                          const Encoder* encoder,
+                                          std::size_t prefix_rows,
+                                          bool reuse_embeddings,
+                                          bool layout_work) const;
+  void SettleRequest();
   void ApplyLayout(const RopeLayout& layout, hipStream_t stream);
   void ReleaseImageStorage(hipStream_t stream);
   static void LaunchRows(float* hidden, const float* embedding,

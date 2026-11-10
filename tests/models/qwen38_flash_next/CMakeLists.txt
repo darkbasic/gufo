@@ -28,6 +28,7 @@ gufo_target_extensions(qwen38_flash_next_runner_options_test EXTENSIONS qwen38_f
 add_qwen38_flash_next_test(probe gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(memory gufo_qwen38_flash_next "cpu;admission")
+target_link_libraries(qwen38_flash_next_memory_test PRIVATE gufo_qwen_vision)
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")

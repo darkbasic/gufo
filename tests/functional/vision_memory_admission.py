@@ -54,6 +54,54 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def qualification_options(command):
+    """Validate the target workload without reinterpreting legacy byte flags."""
+    expected = {"--sessions": "4", "--context": "262144", "--speculative": "mtp",
+                "--draft-tokens": "7", "--cache-ram-bytes": "4294967296",
+                "--cache-disk-bytes": "53687091200", "--vision-memory-policy": "on-demand"}
+    for flag, value in expected.items():
+        require(option(command, flag) == value, f"qualification requires {flag} {value}")
+    require(option(command, "--vision-memory-bytes") is None,
+            "on-demand qualification cannot include --vision-memory-bytes, including zero")
+
+
+def cache_startup_evidence(text):
+    """The full retention grant is required; eager backing commitment is not."""
+    records = [dict(field.split("=", 1) for field in line.split() if "=" in field)
+               for line in text.splitlines()]
+    require(any(record.get("event") == "vision_admission"
+                and record.get("policy") == "on-demand"
+                and record.get("vision_startup_bytes") == "0" for record in records),
+            "startup did not select on-demand admission without an unused vision reservation")
+    grants = [record for record in records if record.get("event") == "vision_cache_grant"
+              and record.get("policy") == "on-demand"]
+    require(grants and all(record.get("granted_bytes") == "4294967296" for record in grants),
+            "effective RAM checkpoint cache is not 4 GiB")
+    require(any(record.get("event") == "configured"
+                and record.get("capacity_bytes") == "4294967296"
+                and record.get("ram_cache") == "on" for record in records),
+            "component cache did not retain its full configured RAM allowance")
+    require(all(record.get("backing") == "lazy" for record in grants),
+            "on-demand policy unexpectedly requires full eager cache backing")
+    backing = [int(record["committed_bytes"]) for record in records
+               if record.get("event") == "backing_prepared"]
+    return {"granted_bytes": 4294967296, "backing": "lazy",
+            "startup_committed_bytes": backing}
+
+
+def populated_cache_evidence(responses):
+    """Free preallocated backing alone is not evidence of a populated cache."""
+    used = []
+    for response in responses:
+        categories = response.get("usage", {}).get("gufo", {}).get(
+            "component_cache", {}).get("global_categories", {})
+        used.append(sum(categories.get(name, {}).get("bytes", 0)
+                        for name in ("backing_assigned", "backing_materialized")))
+    require(used and max(used) > 0,
+            "full-context requests produced no occupied RAM checkpoint backing")
+    return {"occupied_backing_bytes_per_response": used}
+
+
 def process_memory(pid):
     values = {}
     for label, path in (("host", Path("/proc/meminfo")),
@@ -254,6 +302,8 @@ def main():
     parser.add_argument("--prompt-tokens", type=int, default=229000)
     parser.add_argument("--max-tokens", type=int, default=32000)
     parser.add_argument("--timeout", type=float, default=14400)
+    parser.add_argument("--pressure-images", type=int, default=5,
+                        help="4096px images in the refusal workload (1..15); admission is a failed refusal check")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -262,12 +312,12 @@ def main():
     for flag in ("--host", "--port", "--cache-disk", "--served-model-name"):
         if option(command, flag) is not None:
             parser.error(f"this runner owns {flag}")
-    expected = {"--sessions": "4", "--context": "262144", "--speculative": "mtp",
-                "--draft-tokens": "7", "--cache-ram-bytes": "4294967296",
-                "--cache-disk-bytes": "53687091200", "--vision-memory-bytes": "4294967296"}
-    for flag, value in expected.items():
-        if option(command, flag) != value:
-            parser.error(f"qualification requires {flag} {value}")
+    try:
+        qualification_options(command)
+    except RuntimeError as error:
+        parser.error(str(error))
+    if not 1 <= args.pressure_images <= 15:
+        parser.error("--pressure-images must be between 1 and 15 to stay within context")
     if not 0 < args.prompt_tokens <= 262144 - args.max_tokens or args.max_tokens <= 0:
         parser.error("prompt plus output must fit the full context")
     for flag in ("--model", "--mtp-model", "--mmproj"):
@@ -313,14 +363,7 @@ def main():
                 "server changed session count or context")
         require(props["modalities"]["vision"], "vision projector is not available")
         text = log.read_text()
-        require("event=vision_cache_grant policy=request-aware granted_bytes=4294967296" in text,
-                "effective RAM checkpoint cache is not 4 GiB")
-        backing = re.findall(r"event=backing_prepared committed_bytes=(\d+) required_payload_bytes=(\d+)", text)
-        require(len(backing) == 1 and int(backing[0][1]) > 0
-                and int(backing[0][0]) >= int(backing[0][1]),
-                "the full granted checkpoint payload was not committed before readiness")
-        report.setdefault("cache_backing", {})[log.name] = {
-            "committed_bytes": int(backing[0][0]), "required_payload_bytes": int(backing[0][1])}
+        report.setdefault("cache_backing", {})[log.name] = cache_startup_evidence(text)
         require(re.search(r"event=load_completed[^\n]*speculative=mtp", text), "loaded mode is not MTP")
         return props
 
@@ -370,15 +413,19 @@ def main():
             before_text = time.time()
             results = parallel(lambda item: chat(f"text-{item[0]}", item[1]), enumerate(bodies))
             report["concurrency"] = concurrent_progress(samples.records(before_text))
+            report["populated_cache_before_mixed"] = populated_cache_evidence(results)
             require(sum(result["usage"].get("draft_tokens", 0) for result in results) > 0,
                     "MTP was configured but no actual drafts executed")
 
-            # Five maximum-sized images fit context/body limits but exceed the
-            # 4 GiB pool (history embeddings + RGB + encoder work), even cold.
+            # This is a pressure workload, not a fixed-pool arithmetic claim.
+            # On-demand capacity depends on the runtime observation and live
+            # reservations. If it is admitted, refusal qualification fails;
+            # retain that evidence instead of claiming exhaustion was tested.
             oversized = {**image_body, "stream": True, "max_tokens": 16,
                          "messages": [{"role": "user", "content": [
-                             {"type": "image_url", "image_url": {"url": png_url(4096, (i * 40, 0, 0)), "detail": "high"}}
-                             for i in range(5)]}]}
+                             {"type": "image_url", "image_url": {"url": png_url(4096, ((i * 40) % 256, i, 0)), "detail": "high"}}
+                             for i in range(args.pressure_images)]}]}
+            report["pressure_images"] = args.pressure_images
             mixed_image = text_body("mixed-image", 512, args.max_tokens)
             mixed_image["cache_prompt"] = False  # Exercise a fresh image prefix.
             mixed_image["messages"][-1]["content"] = [

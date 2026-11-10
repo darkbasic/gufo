@@ -114,11 +114,141 @@ void RecordedStartupFailure() {
   Require(
       without_vision > selected && without_vision - selected == 686253392ULL,
       "making the entire vision pool lazy still leaves a text-state deficit");
+  const auto on_demand = vision::PlanStartupMemory(
+      selected, scratch, base, worst, 0, four_gib, margin, true);
+  Require(!on_demand.Fits(4) && on_demand.RequiredBytes(4) == 35358287184ULL &&
+              on_demand.DeficitBytes(4, selected) == 686253392ULL,
+          "actual on-demand policy removes only unused vision, not real "
+          "obligations");
   const auto conservative = vision::PlanStartupMemory(
       selected, scratch, base, worst, 0, four_gib, margin);
   Require(
       conservative.per_session_bytes == worst && !conservative.Fits(4),
       "zero retains conservative policy rather than removing vision charges");
+}
+
+void OnDemandObligations() {
+  // Both alternatives reject this honest observation; on-demand admits text
+  // with no image reservation while protecting the same full cache/scratch.
+  const auto legacy = vision::PlanStartupMemory(350, 10, 40, 100, 0, 30, 20);
+  const auto fixed = vision::PlanStartupMemory(350, 10, 40, 100, 140, 30, 20);
+  const auto demand =
+      vision::PlanStartupMemory(350, 10, 40, 100, 0, 30, 20, true);
+  Require(!legacy.Fits(4) && !fixed.Fits(4) && demand.Fits(4),
+          "text eligibility does not require any hypothetical image capacity");
+  Require(
+      demand.shared_reservation_bytes == 60 && demand.RequiredBytes(4) == 220,
+      "on-demand preserves full cache, scratch and safety obligations");
+  const auto exact =
+      vision::PlanStartupMemory(220, 10, 40, 100, 0, 30, 20, true);
+  Require(
+      exact.Fits(4) &&
+          !vision::PlanStartupMemory(219, 10, 40, 100, 0, 30, 20, true).Fits(4),
+      "exact text fit requires no minimum image headroom");
+  auto no_images = std::make_shared<vision::AdmissionBudget>(220, 220);
+  Require(no_images->Outstanding() == 0 && no_images->Capacity() == 0,
+          "zero spare capacity is healthy text-only startup, not conservative "
+          "mode");
+  Refused([&] { (void)no_images->Reserve(1); });
+  Refused([&] { (void)vision::AdmissionBudget(219, 220); });
+  Refused<std::invalid_argument>([&] {
+    (void)vision::PlanStartupMemory(350, 10, 40, 100, 1, 30, 20, true);
+  });
+  Refused(
+      [&] { (void)vision::PlanStartupMemory(10, 1, 1, 2, 0, 10, 0, true); });
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  Refused([&] {
+    (void)vision::PlanStartupMemory(maximum, 1, 1, 2, 0, maximum, 0, true);
+  });
+
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>(350, demand.RequiredBytes(4));
+  Require(budget->OnDemand() && budget->Capacity() == 130 &&
+              budget->ProtectedBytes() == 220 &&
+              budget->AccountedBytes() == 220 && budget->Outstanding() == 0,
+          "epoch starts with funded non-vision obligations and no image usage");
+  budget->ClaimExecutionOwner();
+  Refused([&] { budget->ClaimExecutionOwner(); });
+  Require(budget->Outstanding() == 0,
+          "a second execution/cache pool cannot spend this epoch again");
+  auto image = budget->Reserve(100);
+  auto copy = budget->ReserveShared(30);
+  Refused([&] { (void)budget->Reserve(1); });
+  Refused([&] { (void)budget->ReserveShared(1); });
+  Require(
+      budget->AccountedBytes() == 350,
+      "image and optional checkpoint copies cannot spend the same remainder");
+  // Physical commitment of pre-funded cache/scratch does not change the
+  // accounting epoch or lend its still-unused allowance to another request.
+  std::vector<std::uint8_t> cache_backing(15), scratch(10);
+  Require(cache_backing.size() + scratch.size() == 25 &&
+              budget->AccountedBytes() == 350,
+          "partly committed cache and scratch stay inside protected allowance");
+  cache_backing.resize(30);
+  Require(budget->Outstanding() == 130 && budget->Capacity() == 130,
+          "full lazy cache growth neither subtracts twice nor replenishes "
+          "capacity");
+  copy = {};
+  image = {};
+  Require(budget->Outstanding() == 0 && budget->ProtectedBytes() == 220,
+          "failed image admission cannot consume text or cache obligations");
+  auto subsequent = budget->Reserve(130);
+  subsequent.Shrink(0);
+  Require(!subsequent && budget->Outstanding() == 0,
+          "healthy subsequent work can reuse genuinely released storage");
+}
+
+void ShrinkingReservations() {
+  auto budget = std::make_shared<vision::AdmissionBudget>(130, 30);
+  vision::AdmissionLease image(budget);
+  image.Grow(60);
+  image.Grow(100);
+  image.Shrink(75);
+  Require(image.Bytes() == 75 && budget->Outstanding() == 75,
+          "replacement peak shrinks without another allocation at an exact "
+          "boundary");
+  auto other = budget->Reserve(25);
+  Refused([&] { image.Grow(76); });
+  image.Shrink(50);
+  Require(image.Bytes() == 50 && budget->Outstanding() == 75,
+          "shrinking spans multiple growth reservations");
+  image.Shrink(70);
+  Require(image.Bytes() == 50, "shrink cannot increase an existing claim");
+  image.Shrink(0);
+  Require(budget->Outstanding() == 25,
+          "only the genuinely freed owner releases");
+  Refused<std::invalid_argument>([&] { other.Shrink(26); });
+  Require(other.Info().bytes == 25, "invalid shrink leaves ledger unchanged");
+  other.Shrink(10);
+  auto committed = other.Convert();
+  Require(committed.Info().bytes == 10 && budget->Outstanding() == 10,
+          "conversion after shrink preserves retained allocation ownership");
+  Refused<std::logic_error>([&] { other.Shrink(0); });
+  committed = {};
+  Require(budget->AccountedBytes() == 30,
+          "released ownership keeps base protection");
+
+  gufo::cache::ResourceLedger pool({100, 100, 0, 0});
+  auto backing = pool.Reserve(gufo::cache::ResourceCategory::kBackingFree, 100);
+  Refused<std::invalid_argument>([&] { backing.Shrink(50); });
+  auto block = backing.Convert();
+  auto assigned =
+      block.ReserveBacking(gufo::cache::ResourceCategory::kPrivateState);
+  Refused<std::invalid_argument>([&] { assigned.Shrink(50); });
+  Require(pool.Snapshot().ram_bytes == 100,
+          "pool backing cannot be partially released");
+
+  auto prep_budget = std::make_shared<vision::AdmissionBudget>(
+      vision::kPreparationScratchBytes + vision::kPreparedImageBytes + 10, 10);
+  {
+    vision::PreparationReservation prep(prep_budget, 1);
+    prep.Finish(123);
+    Require(
+        prep_budget->Outstanding() == 123,
+        "completed preparation releases scratch and unused pixel allowance");
+  }
+  Require(prep_budget->Outstanding() == 0,
+          "prepared pixel owner releases only when its content is gone");
 }
 
 void StartupCapacitySelection() {
@@ -464,6 +594,8 @@ void PreparationLifetimes() {
 int main() {
   StartupPolicies();
   RecordedStartupFailure();
+  OnDemandObligations();
+  ShrinkingReservations();
   StartupCapacitySelection();
   GeometryAndHistory();
   LifetimeAndGrowth();

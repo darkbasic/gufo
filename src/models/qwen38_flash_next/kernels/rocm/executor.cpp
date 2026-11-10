@@ -26,6 +26,7 @@
 #include "qfn_mmq.h"
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/snapshot_admission.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -186,8 +187,14 @@ public:
   static constexpr std::size_t kSpareBlocks = 2;
 
   /// `reserve` is the device memory every commit leaves free.
-  explicit SnapshotAllocator(std::uint64_t reserve, bool protect_host = false)
-      : reserve_(reserve), protect_host_(protect_host) {
+  explicit SnapshotAllocator(
+      std::uint64_t reserve, bool protect_host,
+      std::shared_ptr<qwen::vision::AdmissionBudget> budget,
+      std::size_t protected_spare_bytes)
+      : reserve_(reserve),
+        protect_host_(protect_host),
+        admission_(std::move(budget), protected_spare_bytes) {
+    spares_.reserve(kSpareBlocks);
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -202,39 +209,54 @@ public:
     }
   }
   ~SnapshotAllocator() {
-    for (void* spare : spares_)
-      (void)hipFree(spare);
+    for (const auto& spare : spares_)
+      (void)hipFree(spare.pointer);
     (void)hipStreamSynchronize(stream_);
+    spares_.clear();
     (void)hipStreamDestroy(stream_);
     for (hipStream_t stream : free_streams_)
       (void)hipStreamDestroy(stream);
     (void)hipMemPoolDestroy(pool_);
   }
   std::shared_ptr<void> Allocate(std::uint64_t bytes) {
-    std::lock_guard lock(mutex_);
-    return Own(Commit(bytes), bytes);
+    Block block;
+    {
+      std::lock_guard lock(mutex_);
+      block = Commit(bytes);
+    }
+    return Own(std::move(block), bytes);
   }
   /// Allocates storage the reserve already counts (the checkpoint arena): it
   /// needs the reserve free only beyond its own bytes.
   std::shared_ptr<void> AllocateReserved(std::uint64_t bytes) {
-    std::lock_guard lock(mutex_);
-    return Own(Commit(bytes, bytes), bytes);
+    Block block;
+    {
+      std::lock_guard lock(mutex_);
+      block = Commit(bytes, bytes);
+    }
+    return Own(std::move(block), bytes);
   }
   /// Allocates the recurring mutable-state size, from a released block when
   /// one is kept.
   std::shared_ptr<void> AllocateSpare(std::uint64_t bytes) {
-    std::lock_guard lock(mutex_);
-    if (spare_bytes_ != bytes) {
-      for (void* spare : spares_)
-        (void)hipFree(spare);
-      spares_.clear();
-      spare_bytes_ = bytes;
+    Block block;
+    {
+      std::lock_guard lock(mutex_);
+      if (spare_bytes_ != bytes) {
+        for (const auto& spare : spares_)
+          (void)hipFree(spare.pointer);
+        (void)hipStreamSynchronize(stream_);
+        spares_.clear();
+        spare_bytes_ = bytes;
+      }
+      if (spares_.empty()) {
+        block = Commit(bytes, 0, true);
+      } else {
+        block = std::move(spares_.back());
+        spares_.pop_back();
+      }
     }
-    if (spares_.empty())
-      return Own(Commit(bytes), bytes);
-    void* data = spares_.back();
-    spares_.pop_back();
-    return Own(data, bytes);
+    return Own(std::move(block), bytes);
   }
   /// Bytes the spare blocks may hold, for scratch accounting.
   [[nodiscard]] static std::uint64_t SpareBytes(std::uint64_t block) {
@@ -255,6 +277,12 @@ public:
     // Optional snapshot copies must respect the host partition as well.
     if (protect_host_)
       free = std::min(free, ext::HostSnapshotCeilingBytes());
+    // The on-demand epoch already protects cache/text/deferred obligations,
+    // whether or not their backing exists. Do not deduct committed portions
+    // again from a fresh free-memory reading. Retain the physical safety
+    // margin as a defensive check against pressure outside this epoch.
+    if (admission_.OnDemand())
+      return free >= bytes && free - bytes >= kSnapshotDeviceSlackBytes;
     return free >= bytes &&
            (reserved >= reserve_ || free - bytes >= reserve_ - reserved);
   }
@@ -281,34 +309,65 @@ public:
   }
 
 private:
+  struct Block {
+    void* pointer{};
+    cache::ResourceCharge charge;
+  };
+
   static void CheckStatus(hipError_t error, const char* operation) {
     if (error != hipSuccess)
       throw std::runtime_error(std::string(operation) + ": " +
                                hipGetErrorString(error));
   }
-  void* Commit(std::uint64_t bytes, std::uint64_t reserved = 0) {
+  Block Commit(std::uint64_t bytes, std::uint64_t reserved = 0,
+               bool mutable_state = false) {
+    cache::ResourceReservation reservation;
+    if (!reserved) {
+      try {
+        reservation = admission_.Reserve(bytes, mutable_state);
+      } catch (const core::ResourceAdmissionError&) {
+        throw SnapshotDeviceExhausted(
+            "snapshot storage exceeds shared admission headroom");
+      }
+    }
     if (!Fits(bytes, reserved))
       throw SnapshotDeviceExhausted("snapshot storage exceeds device headroom");
     void* data = nullptr;
-    CheckStatus(hipMallocFromPoolAsync(&data, bytes, pool_, stream_),
-                "snapshot allocate");
+    const auto allocated = hipMallocFromPoolAsync(&data, bytes, pool_, stream_);
+    if (allocated == hipErrorMemoryAllocation)
+      throw SnapshotDeviceExhausted("snapshot allocation exhausted memory");
+    CheckStatus(allocated, "snapshot allocate");
     const auto ready = hipStreamSynchronize(stream_);
     if (ready != hipSuccess) {
       (void)hipFree(data);
       (void)hipStreamSynchronize(stream_);
+      if (ready == hipErrorMemoryAllocation)
+        throw SnapshotDeviceExhausted("snapshot allocation exhausted memory");
       CheckStatus(ready, "snapshot allocation ready");
     }
-    return data;
+    try {
+      return {data,
+              reservation ? reservation.Convert() : cache::ResourceCharge{}};
+    } catch (...) {
+      (void)hipFree(data);
+      (void)hipStreamSynchronize(stream_);
+      throw;
+    }
   }
-  std::shared_ptr<void> Own(void* data, std::uint64_t bytes) {
-    return {data, [owner = shared_from_this(), bytes](void* pointer) {
-              owner->Release(pointer, bytes);
+  std::shared_ptr<void> Own(Block block, std::uint64_t bytes) {
+    // Construct outside mutex_: a failed shared_ptr control-block allocation
+    // invokes this deleter, which must be able to take the allocator lock.
+    return {block.pointer,
+            [owner = shared_from_this(), bytes,
+             charge = std::move(block.charge)](void* pointer) mutable {
+              owner->Release(pointer, bytes, std::move(charge));
             }};
   }
-  void Release(void* pointer, std::uint64_t bytes) {
+  void Release(void* pointer, std::uint64_t bytes,
+               cache::ResourceCharge charge) {
     std::lock_guard lock(mutex_);
     if (bytes == spare_bytes_ && spares_.size() < kSpareBlocks) {
-      spares_.push_back(pointer);
+      spares_.push_back({pointer, std::move(charge)});
       return;
     }
     // In ROCm, hipFree recognizes pool allocations and bypasses SyncAllStreams.
@@ -320,8 +379,9 @@ private:
   }
   std::uint64_t reserve_;
   bool protect_host_;
+  SnapshotAdmission admission_;
   std::mutex mutex_;
-  std::vector<void*> spares_;
+  std::vector<Block> spares_;
   std::uint64_t spare_bytes_{0};
   hipStream_t stream_{nullptr};
   std::mutex streams_mutex_;
@@ -337,7 +397,11 @@ std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
             qwen::vision::CheckedAdd(DeferredScratchBytes(),
                                      kSnapshotDeviceSlackBytes),
             vision_snapshot_reserve_),
-        bool(vision_memory_budget_));
+        bool(vision_memory_budget_), vision_memory_budget_,
+        SnapshotAllocator::SpareBytes(
+            SessionMemory(core::SessionMode::kAutoregressive, context_capacity_,
+                          0)
+                .recurrent_bytes));
   });
   return snapshot_allocator_;
 }

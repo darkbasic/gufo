@@ -1,15 +1,21 @@
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <barrier>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <latch>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "src/core/hip/committed_backing.hpp"
 #include "src/core/hip/component_cache_resources.hpp"
 #include "src/core/resource_error.hpp"
+#include "src/families/qwen/vision/admission.hpp"
 #include "tests/cache/fake_adapter.hpp"
 
 namespace {
@@ -78,6 +84,128 @@ void Check(bool full, bool headroom, bool registration, bool query) {
   }
   assert(registered.empty() && ledger.Snapshot().total_bytes == 0);
 }
+
+void OnDemandLazyBacking(bool inject_registration_failure) {
+  using namespace gufo;
+  constexpr std::size_t block = 4096;
+  constexpr std::size_t cache_bytes = kPayloadBytes + kMetadataBytes;
+  constexpr std::size_t text_bytes = block;
+  constexpr std::size_t scratch_bytes = block;
+  constexpr std::size_t margin_bytes = block;
+  constexpr std::size_t image_bytes = 2 * block;
+  constexpr std::size_t protected_bytes =
+      cache_bytes + text_bytes + scratch_bytes + margin_bytes;
+  constexpr std::size_t capacity = protected_bytes + image_bytes;
+  models::qwen::vision::AdmissionBudget admission(capacity, protected_bytes);
+  cache::ResourceLedger cache_ledger({cache_bytes, cache_bytes, 0, 0});
+  fail_registration = false;
+  fail_query = false;
+  std::barrier start(2);
+  std::latch image_live(1), release_image(1);
+  std::atomic<bool> synchronize_growth{false};
+  const auto refused = [&](bool shared, std::size_t bytes) {
+    bool exhausted = false;
+    try {
+      auto extra =
+          shared ? admission.ReserveShared(bytes) : admission.Reserve(bytes);
+    } catch (const core::ResourceAdmissionError&) {
+      exhausted = true;
+    }
+    assert(exhausted);
+  };
+  {
+    hip::CommittedBackingPool pool(
+        cache_ledger,
+        {.ram_bytes = cache_bytes,
+         .block_bytes = block,
+         .metadata_headroom_bytes = kMetadataBytes,
+         .segment_bytes = block,
+         .admit_segment =
+             [&](std::size_t bytes) {
+               assert(bytes == block);
+               if (synchronize_growth.exchange(false)) {
+                 start.arrive_and_wait();
+                 image_live.wait();
+                 assert(admission.AccountedBytes() == capacity);
+               }
+               // Physical growth spends the cache allowance already protected
+               // in the shared epoch. It never competes for the image
+               // remainder.
+               return true;
+             },
+         .keep_segment =
+             [](std::size_t, std::size_t before, std::size_t after) {
+               return hip::RegistrationKeepsReserve(before, after);
+             }});
+    assert(!pool.CommittedBytes());
+    assert(admission.AccountedBytes() == protected_bytes);
+    assert(!admission.Outstanding());
+    pool.GrowAhead(block);
+    pool.WaitForGrowth();
+    assert(pool.CommittedBytes() == block);
+    assert(cache_ledger.Snapshot().total_bytes == kMetadataBytes + block);
+    // Most payload is uncommitted, but its full configured allowance is not
+    // available for images. The fake HIP reading stays optimistically high.
+    refused(false, image_bytes + 1);
+    assert(admission.AccountedBytes() == protected_bytes);
+
+    synchronize_growth = true;
+    fail_registration = inject_registration_failure;
+    std::thread image([&] {
+      start.arrive_and_wait();
+      auto reservation = admission.Reserve(image_bytes);
+      std::vector<std::byte> pixels(image_bytes);
+      image_live.count_down();
+      release_image.wait();
+      // Pixels are destroyed before the reservation leaves this scope.
+    });
+    pool.GrowAhead(kPayloadBytes);
+    pool.WaitForGrowth();
+    assert(pool.CommittedBytes() ==
+           (inject_registration_failure ? block : kPayloadBytes));
+    assert(cache_ledger.Snapshot().total_bytes ==
+           kMetadataBytes + pool.CommittedBytes());
+    assert(registered.size() == pool.CommittedBytes() / block);
+    assert(admission.AccountedBytes() == capacity);
+    assert(admission.Outstanding() == image_bytes);
+    refused(false, 1);
+    refused(true, 1);
+    if (inject_registration_failure) {
+      // One explicit recovery after removing the injected fault, not a loop
+      // that waits for a favorable capacity observation or hides a failure.
+      fail_registration = false;
+      pool.GrowAhead(kPayloadBytes);
+      pool.WaitForGrowth();
+      assert(pool.CommittedBytes() == kPayloadBytes);
+      assert(cache_ledger.Snapshot().total_bytes == cache_bytes);
+      assert(admission.AccountedBytes() == capacity);
+      refused(false, 1);
+    }
+    release_image.count_down();
+    image.join();
+    assert(!admission.Outstanding());
+    assert(admission.AccountedBytes() == protected_bytes);
+    assert(pool.CommittedBytes() == kPayloadBytes);
+    // Text/scratch use their protected allowance while cached backing stays
+    // physically committed. Another image can reuse only the same remainder.
+    std::vector<std::byte> text(text_bytes), scratch(scratch_bytes);
+    auto checkpoint =
+        pool.TryAcquire(cache::ResourceCategory::kPrivateState, 32);
+    assert(checkpoint);
+    checkpoint->Bytes().front() = std::byte{7};
+    checkpoint->Convert();
+    {
+      auto reservation = admission.Reserve(image_bytes);
+      std::vector<std::byte> pixels(image_bytes);
+      assert(admission.AccountedBytes() == capacity);
+      refused(false, 1);
+    }
+    assert(!admission.Outstanding());
+    assert(cache_ledger.Snapshot().total_bytes == cache_bytes);
+  }
+  assert(registered.empty() && !cache_ledger.Snapshot().total_bytes);
+  assert(admission.AccountedBytes() == protected_bytes);
+}
 }  // namespace
 
 hipError_t hipHostMalloc(void** pointer, std::size_t bytes, unsigned) {
@@ -144,4 +272,6 @@ int main() {
     Check(full, true, false, true);
     Check(full, true, true, false);
   }
+  OnDemandLazyBacking(false);
+  OnDemandLazyBacking(true);
 }

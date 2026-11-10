@@ -1,6 +1,7 @@
 #ifndef GUFO_FAMILIES_QWEN_VISION_ADMISSION_HPP_
 #define GUFO_FAMILIES_QWEN_VISION_ADMISSION_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -44,19 +45,42 @@ struct ImageDimensions {
     std::size_t prefix_rows, std::span<const ImageDimensions> images,
     std::uint32_t output_width);
 
-/// A fixed, model-wide budget carved out before text-session/cache admission.
-/// Physical free-memory readings never replenish it: outstanding reservations
-/// are always included by ResourceLedger's atomic capacity check.
+/// One model-lifetime capacity observation. Fixed-pool mode reserves capacity
+/// at startup. On-demand mode protects text/cache/scratch obligations instead;
+/// images and optional device snapshot copies acquire only actual demand from
+/// the remainder. Lazy backing spends its protected allowance, never this
+/// remainder. Later free readings cannot replenish either ledger or spend
+/// committed storage twice. External pressure can still cause allocation
+/// failure.
 class AdmissionBudget {
 public:
   explicit AdmissionBudget(std::size_t capacity);
+  AdmissionBudget(std::size_t capacity, std::size_t protected_bytes);
   [[nodiscard]] cache::ResourceReservation Reserve(std::size_t bytes);
+  [[nodiscard]] cache::ResourceReservation ReserveShared(std::size_t bytes);
   [[nodiscard]] std::size_t Capacity() const noexcept { return capacity_; }
+  [[nodiscard]] bool OnDemand() const noexcept { return on_demand_; }
+  [[nodiscard]] std::size_t ProtectedBytes() const noexcept {
+    return protected_bytes_;
+  }
+  [[nodiscard]] std::size_t AccountedBytes() const;
+  /// One startup epoch funds one execution/cache owner. Reusing its runner
+  /// for another pool would promise the same text/cache allowance twice.
+  /// Failed initialization requires a new runner and capacity observation.
+  void ClaimExecutionOwner();
+  /// Additional obligations, including both retained allocations and work
+  /// admitted before allocation. They are not subtracted from a newer reading.
   [[nodiscard]] std::size_t Outstanding() const;
 
 private:
+  [[nodiscard]] cache::ResourceReservation Reserve(
+      cache::ResourceCategory category, std::size_t bytes);
   const std::size_t capacity_;
+  const bool on_demand_{false};
+  const std::size_t protected_bytes_{0};
   cache::ResourceLedger ledger_;
+  cache::ResourceReservation protected_;
+  std::atomic_flag execution_owner_{};
 };
 
 /// Decode/resize processes one image at a time. The working allowance covers
@@ -78,10 +102,13 @@ public:
   PreparationReservation(const PreparationReservation&) = delete;
   PreparationReservation& operator=(const PreparationReservation&) = delete;
   void Finish() noexcept;
+  /// On-demand prepared owners keep only actual RGB capacity after resizing.
+  void Finish(std::size_t pixel_bytes);
 
 private:
   cache::ResourceReservation scratch_;
   cache::ResourceReservation pixels_;
+  bool on_demand_{false};
 };
 
 /// One session's high-water claim. Grow precedes any image allocation; failed
@@ -99,12 +126,19 @@ public:
   AdmissionLease(const AdmissionLease&) = delete;
   AdmissionLease& operator=(const AdmissionLease&) = delete;
   void Grow(std::size_t bytes);
+  /// Call after transient allocations/work end; retained and future required
+  /// buffers must remain covered. Never allocates and cannot grow the claim.
+  void Shrink(std::size_t bytes) noexcept;
   void Clear() noexcept;
   [[nodiscard]] std::size_t Bytes() const noexcept { return bytes_; }
 
 private:
   std::shared_ptr<AdmissionBudget> budget_;
-  std::vector<cache::ResourceReservation> reservations_;
+  struct Part {
+    cache::ResourceReservation reservation;
+    std::size_t bytes;
+  };
+  std::vector<Part> reservations_;
   std::size_t bytes_{0};
 };
 
@@ -131,8 +165,10 @@ struct StartupMemoryPlan {
                                          std::size_t available) const;
 };
 
-/// Preserve legacy admission when vision_budget is zero. Request-aware mode
-/// subtracts every UNCOMMITTED shared allowance once, then tests text/MTP
+/// Preserve legacy admission when vision_budget is zero and on_demand is false.
+/// On-demand startup has no image deduction and preserves lazy cache backing.
+/// Fixed-pool mode reserves vision_budget as before. Both opt-in modes
+/// subtract every UNCOMMITTED shared allowance once, then test text/MTP
 /// state per session. The cache grant is reserved in full, never trimmed here.
 /// Already committed allocations lower the capacity snapshot instead. For
 /// example startup DeferredScratchBytes omits existing logits/checkpoint/wide
@@ -142,7 +178,7 @@ struct StartupMemoryPlan {
     std::size_t available_bytes, std::size_t deferred_scratch,
     std::size_t base_per_session, std::size_t conservative_per_session,
     std::size_t vision_budget, std::size_t cache_budget,
-    std::size_t runtime_margin);
+    std::size_t runtime_margin, bool on_demand = false);
 
 }  // namespace gufo::models::qwen::vision
 

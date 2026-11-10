@@ -1,9 +1,11 @@
 # Vision admission: recorded ZBook refusal
 
-As of November 10, 2026, the recorded four-session configuration still exceeds
-the admission budget. This follow-up adds production accounting tests and one
-consistent diagnostic; it claims **zero bytes of memory savings**. Physical
-four-session fit and GPU execution remain unverified by the development VM.
+This historical audit records the fixed-pool configuration and follow-up as of
+November 10, 2026, before the on-demand policy. That follow-up added production
+accounting tests and one consistent diagnostic, claiming **zero bytes of memory
+savings**. The measurements and results below remain evidence for that version;
+the [current policy](VISION-MEMORY.md) retains its failing regression and adds
+on-demand admission. Physical fit and GPU execution remain unverified by the VM.
 
 ## Recorded requirement
 
@@ -37,7 +39,7 @@ above and requires refusal. Unequal host/device limits, exact boundaries,
 outstanding reservations and already-committed allocations use the production
 selector and planner; consumed bytes are never credited back to free memory.
 
-## Ownership audit
+## Fixed-pool ownership audit
 
 `PlanSessionMemory()` now supplies the components used by the real executor's
 `SessionBytes()`. Its fixed target fixture reconstructs each byte:
@@ -156,8 +158,11 @@ cmake --preset release
 cmake --build --preset release --parallel 4
 ```
 
-Run only the [targeted owner admission reproduction](VISION-MEMORY-VALIDATION.md#targeted-admission-follow-up)
-next. Its new evidence is the pair of final limits and their decomposition.
-A repeated load without a changed candidate or a new concrete hypothesis adds
-no required evidence. Full numerical and concurrent workload qualification
-remains pending until the capacity constraint is resolved.
+The current candidate uses the [single owner workload attempt](VISION-MEMORY-VALIDATION.md#one-targeted-full-workload-attempt)
+to collect the final pair of limits and, only if admitted, exercise concurrent
+work. On-demand removes the fixed image deduction but keeps the full cache and
+safety obligations: 35,358,287,184 bytes are still required, leaving a
+686,253,392-byte deficit at this recorded capacity. Its lazy cache backing is
+described separately from the historical full-backing policy above. A repeated
+load without a changed candidate or concrete new hypothesis adds no required
+evidence. Numerical and physical-capacity qualification remain pending.

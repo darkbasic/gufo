@@ -34,6 +34,17 @@
   ],
   "options": [
     {
+      "name": "--vision-memory-policy",
+      "type": "string",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "Vision admission: conservative (default) or on-demand; on-demand reserves image memory only for actual requests"
+    },
+    {
       "name": "--vision-memory-bytes",
       "type": "integer",
       "commands": [
@@ -42,7 +53,7 @@
       "providers": [
         "flash-next-q4"
       ],
-      "help": "Shared request-aware vision memory budget in bytes; 0 keeps conservative per-session admission (default)"
+      "help": "Legacy fixed shared vision pool in bytes; 0 keeps conservative admission; cannot be combined with on-demand policy"
     },
     {
       "name": "--mtp-model",

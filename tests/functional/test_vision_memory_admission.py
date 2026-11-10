@@ -3,7 +3,91 @@
 import unittest
 from unittest.mock import patch
 
-from vision_memory_admission import concurrent_progress, mixed_progress, run_mixed_phase
+from vision_memory_admission import (cache_startup_evidence, concurrent_progress, mixed_progress,
+                                     populated_cache_evidence, qualification_options, run_mixed_phase)
+
+
+class OnDemandQualification(unittest.TestCase):
+    @staticmethod
+    def command():
+        return ["gufo", "serve", "llm", "--sessions", "4", "--context", "262144",
+                "--speculative", "mtp", "--draft-tokens", "7", "--cache-ram-bytes", "4294967296",
+                "--cache-disk-bytes", "53687091200", "--vision-memory-policy", "on-demand"]
+
+    @staticmethod
+    def startup():
+        return ("schema=vision-admission-v1 event=vision_admission policy=on-demand "
+                "vision_capacity_bytes=1000000000 vision_startup_bytes=0\n"
+                "schema=vision-admission-v1 event=vision_cache_grant policy=on-demand "
+                "granted_bytes=4294967296 backing=lazy\n"
+                "schema=component-cache-v1 event=configured capacity_bytes=4294967296 "
+                "disk_capacity_bytes=53687091200 ram_cache=on\n")
+
+    def test_exact_target_uses_explicit_on_demand_policy(self):
+        qualification_options(self.command())
+        command = self.command()[:-2] + ["--vision-memory-policy=on-demand"]
+        qualification_options(command)
+
+    def test_legacy_byte_flag_cannot_be_reinterpreted_as_on_demand(self):
+        for value in ("0", "4294967296"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "cannot include"):
+                qualification_options(self.command() + [f"--vision-memory-bytes={value}"])
+
+    def test_changed_policy_or_target_budget_fails_qualification(self):
+        for flag, value in (("--vision-memory-policy", "conservative"), ("--sessions", "3"),
+                            ("--context", "131072"), ("--cache-ram-bytes", "2147483648"),
+                            ("--cache-disk-bytes", "4294967296"), ("--draft-tokens", "6"),
+                            ("--speculative", "off")):
+            command = self.command()
+            command[command.index(flag) + 1] = value
+            with self.subTest(flag=flag), self.assertRaisesRegex(RuntimeError, "qualification requires"):
+                qualification_options(command)
+
+    def test_lazy_cache_retains_full_grant_without_eager_backing(self):
+        result = cache_startup_evidence(self.startup())
+        self.assertEqual(result, {"granted_bytes": 4294967296, "backing": "lazy",
+                                  "startup_committed_bytes": []})
+        result = cache_startup_evidence(self.startup()
+                                       + "event=backing_prepared committed_bytes=4096\n")
+        self.assertEqual(result["startup_committed_bytes"], [4096])
+
+    def test_reduced_grant_or_wrong_backing_fails(self):
+        for before, after, diagnostic in (
+                ("granted_bytes=4294967296", "granted_bytes=2147483648", "not 4 GiB"),
+                ("backing=lazy", "backing=eager", "eager cache backing"),
+                ("capacity_bytes=4294967296 ", "capacity_bytes=2147483648 ", "full configured"),
+                ("ram_cache=on", "ram_cache=off", "full configured")):
+            with self.subTest(after=after), self.assertRaisesRegex(RuntimeError, diagnostic):
+                cache_startup_evidence(self.startup().replace(before, after))
+
+    def test_unused_pool_and_legacy_policy_cannot_qualify(self):
+        for before, after in (("vision_startup_bytes=0", "vision_startup_bytes=4294967296"),
+                              ("policy=on-demand", "policy=request-aware")):
+            with self.subTest(after=after), self.assertRaisesRegex(RuntimeError, "startup did not select"):
+                cache_startup_evidence(self.startup().replace(before, after))
+
+    def test_similar_field_names_do_not_establish_cache_grant(self):
+        log = self.startup().replace("event=configured capacity_bytes=4294967296",
+                                     "event=configured staging_capacity_bytes=4294967296")
+        with self.assertRaisesRegex(RuntimeError, "full configured"):
+            cache_startup_evidence(log)
+
+    @staticmethod
+    def cache_response(**categories):
+        return {"usage": {"gufo": {"component_cache": {"global_categories": {
+            key: {"bytes": value} for key, value in categories.items()}}}}}
+
+    def test_occupied_cache_backing_is_required_before_mixed_phase(self):
+        evidence = populated_cache_evidence([
+            self.cache_response(backing_assigned=1024, backing_materialized=2048),
+            self.cache_response(backing_assigned=4096)])
+        self.assertEqual(evidence["occupied_backing_bytes_per_response"], [3072, 4096])
+
+    def test_free_or_missing_backing_is_not_a_populated_cache(self):
+        for responses in ([], [{}], [self.cache_response(backing_free=4294967296)],
+                          [self.cache_response(backing_assigned=0, backing_materialized=0)]):
+            with self.subTest(responses=responses), self.assertRaisesRegex(RuntimeError, "no occupied"):
+                populated_cache_evidence(responses)
 
 
 def snapshot(tasks=(1, 2, 3, 4), progress=(0, 0, 0, 0), active=4, now=0,

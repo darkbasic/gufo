@@ -7,6 +7,78 @@ The [accounting analysis](VISION-MEMORY.md) and
 [owner-run GPU procedure](VISION-MEMORY-VALIDATION.md) describe the remaining
 physical-capacity, performance and numerical checks.
 
+## On-demand follow-up
+
+As of November 10, 2026, the on-demand implementation and harness passed the
+CPU checks below, starting from `d3e9031bee83b27e9babd75b371cbad2ff85ea94`.
+These results do not establish real HIP
+compilation, numerical correctness or the target machine's memory fit.
+
+| Current check | Result |
+| --- | --- |
+| Build `qwen38_flash_next_runner_options_test` with `cpu-test` | Passed |
+| CTest `qwen38_flash_next.runner_options` | 1/1 passed; 0.00 seconds |
+| Harness CPU configuration/evidence/orchestration tests | 30/30 passed; final run 0.003 seconds |
+| Python compilation, focused C++ formatting and metadata JSON syntax | Passed |
+| Combined focused CPU build and ten CTest regressions listed below | Passed; 10/10, 4.52 seconds |
+| Additional lazy-backing concurrent-image/allocation-failure case | Rebuilt backing target; focused CTest 1/1 passed, 0.01 seconds |
+| Final native PR gate after ownership fixes | 115/115 passed; 34.07 seconds |
+| Targeted ASan/UBSan with leak detection | Admission, snapshot accounting, DeviceInput/pixel ownership and cache backing passed; no diagnostics |
+
+The option test uses generated production provider metadata and the production
+validation helpers. It covers default/zero/fixed-pool compatibility, explicit
+on-demand, projector requirements, conflicting options and unsupported
+providers/commands. Harness tests retain concurrent/mixed task attribution,
+post-refusal progress and recovery checks; new cases distinguish a full lazy
+cache grant from eager commitment and occupied backing from free backing.
+The final lifecycle tests exercise production `Prompt::RetainPixels()` through
+prompt/image copies and value assignment. The ledger tests refuse a second
+execution/cache owner for an on-demand epoch. The real backing allocator grows
+from partial to full backing while an image holds all extra capacity, including
+injected registration failure and recovery.
+
+Commands, with the dependency environment described below:
+
+```sh
+cmake --build --preset cpu-test --parallel 4 --target qwen38_flash_next_runner_options_test
+ctest --test-dir build/cpu-test -R '^qwen38_flash_next\.runner_options$' --output-on-failure
+python3 tests/functional/test_vision_memory_admission.py
+python3 -m py_compile tests/functional/vision_memory_admission.py tests/functional/test_vision_memory_admission.py
+clang-format --dry-run --Werror src/models/qwen38_flash_next/runner.hpp tests/models/qwen38_flash_next/runner_options_test.cpp
+python3 -m json.tool src/models/qwen38_flash_next/extension.json >/dev/null
+
+cmake --build --preset cpu-test --parallel 4 --target \
+  component_text_cache_test admission_memory_test text_model_runner_test \
+  text_generation_scheduler_test cache_full_backing_test cache_ledger_test \
+  qwen_vision_admission_test qwen_vision_lifecycle_test \
+  qwen38_flash_next_runner_options_test qwen38_flash_next_memory_test
+ctest --preset cpu-test --output-on-failure -R \
+  '^(component_text_cache_test|admission_memory_test|text_model_runner_test|text_generation_scheduler_test|cache_full_backing_test|cache_ledger_test|qwen_vision_admission_test|qwen_vision_lifecycle_test|qwen38_flash_next\.runner_options|qwen38_flash_next\.memory)$'
+
+# After adding the production lazy-backing integration case:
+cmake --build --preset cpu-test --target cache_full_backing_test --parallel 2
+ctest --preset cpu-test -R '^cache_full_backing_test$' --output-on-failure
+
+# Final wider CPU contract gate, after the ownership fixes:
+cmake --build --preset pr --parallel 4
+```
+
+The final gate log is `/tmp/gufo-920-on-demand-pr.log`. Targeted sanitizer
+compiler commands and results are retained in
+`/tmp/gufo-920-on-demand-sanitizers.log`; all four ran with
+`ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`. They instrument the production
+admission/ledger, prompt ownership/DeviceInput and backing sources as applicable;
+other dependencies use the prebuilt CPU libraries. They do not instrument the
+real HIP executor or establish full-tree sanitizer coverage.
+
+The real HIP release build and hardware execution remain pending under the
+[owner procedure](VISION-MEMORY-VALIDATION.md). This VM has no `hipcc` or Nix,
+no `/opt/rocm` or `/usr/lib/rocm`, and no local ROCm container image. The sections
+below preserve earlier fixed-pool results; their counts are not new on-demand
+results. The whole-tree formatting check still flags only the two unchanged
+files listed below; all 18 changed C++/HIP files pass their formatting check.
+
 ## Validation review follow-up
 
 As of November 9, 2026, the focused review started from a clean tree at

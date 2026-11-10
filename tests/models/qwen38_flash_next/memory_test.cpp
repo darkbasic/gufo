@@ -1,11 +1,18 @@
 #include "src/models/qwen38_flash_next/memory.hpp"
 
+#include <atomic>
+#include <barrier>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string_view>
+#include <thread>
+
+#include "src/models/qwen38_flash_next/snapshot_admission.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 using gufo::core::SessionMode;
+namespace vision = gufo::models::qwen::vision;
 
 namespace {
 void Require(bool condition, std::string_view message) {
@@ -94,10 +101,132 @@ void ModesAndGrowth() {
           qfn::GdnRollbackRowFloats(1, 16, 48, 128) == 8288,
       "first frontier is full state, subsequent frontiers are exact deltas");
 }
+
+template<class Action>
+void Refused(Action action, std::string_view message) {
+  try {
+    action();
+  } catch (const gufo::core::ResourceAdmissionError&) {
+    return;
+  }
+  Require(false, message);
+}
+
+void SnapshotAdmissionOwnership() {
+  // The protected 600 includes a 200-byte mutable-spare allowance, text,
+  // future cache backing and scratch. None of that is physically allocated.
+  auto budget = std::make_shared<vision::AdmissionBudget>(1000, 600);
+  qfn::SnapshotAdmission snapshots(budget, 200);
+  auto image = budget->Reserve(250);
+  auto first = snapshots.Reserve(100, true);
+  auto second = snapshots.Reserve(100, true);
+  Require(budget->Outstanding() == 250,
+          "two mutable blocks use protected scratch without a second charge");
+  auto third = snapshots.Reserve(100, true);
+  Require(budget->Outstanding() == 350,
+          "additional live mutable copies compete with images");
+  Refused([&] { (void)snapshots.Reserve(51, false); },
+          "aggregate image and private copies cannot exceed the epoch");
+  auto extra = snapshots.Reserve(50, false);
+  Require(budget->AccountedBytes() == 1000, "exact aggregate boundary fits");
+  Refused([&] { (void)budget->Reserve(1); },
+          "images cannot take an admitted private snapshot's bytes");
+  auto retained = third.Convert();
+  auto spare = std::move(retained);
+  Require(budget->Outstanding() == 400,
+          "moving a released allocation into retained spares keeps its charge");
+  extra = {};
+  Require(budget->Outstanding() == 350,
+          "only the genuinely released allocation returns capacity");
+  auto reused = std::move(spare);
+  Require(budget->Outstanding() == 350,
+          "reusing retained storage neither releases nor reserves twice");
+  first = {};
+  auto replacement = snapshots.Reserve(100, true);
+  Require(budget->Outstanding() == 350,
+          "freed protected allocation makes its existing allowance reusable");
+  reused = {};
+  Require(
+      budget->Outstanding() == 250,
+      "freeing the optional physical allocation releases its shared ticket");
+  Refused(
+      [&] {
+        (void)snapshots.Reserve(std::numeric_limits<std::size_t>::max(), false);
+      },
+      "overflow-sized optional copies fail without changing ownership");
+  Require(budget->Outstanding() == 250,
+          "failed growth leaves existing images and spare claims intact");
+}
+
+void SnapshotAdmissionFailuresAndModes() {
+  auto budget = std::make_shared<vision::AdmissionBudget>(100, 60);
+  qfn::SnapshotAdmission snapshots(budget, 20);
+  for (const bool mutable_state : {false, true}) {
+    try {
+      auto pending = snapshots.Reserve(20, mutable_state);
+      // Inject failure after admission, before allocation/conversion.
+      throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+    }
+    Require(budget->Outstanding() == 0,
+            "failed allocation rolls back its unmaterialized ticket");
+  }
+  auto protected_block = snapshots.Reserve(20, true);
+  auto active = snapshots.Reserve(40, true);
+  Refused([&] { (void)snapshots.Reserve(1, false); },
+          "failure and retry preserve the protected-spare bound");
+  active = {};
+  auto copy = snapshots.Reserve(40, false).Convert();
+  Require(budget->Outstanding() == 40,
+          "successful conversion retains capacity through asynchronous use");
+  copy = {};
+  Require(budget->Outstanding() == 0,
+          "completion and release restore capacity for later requests");
+  auto image = budget->Reserve(40);
+  Refused([&] { (void)snapshots.Reserve(21, true); },
+          "changing mutable size cannot enlarge the protected spare allowance");
+  qfn::SnapshotAdmission conservative(nullptr, 20);
+  auto fixed = std::make_shared<vision::AdmissionBudget>(1);
+  qfn::SnapshotAdmission fixed_snapshots(fixed, 20);
+  Require(!conservative.Reserve(1000, false) &&
+              !fixed_snapshots.Reserve(1000, true) && !fixed->Outstanding(),
+          "conservative and fixed-pool snapshot behavior remains unchanged");
+}
+
+void ConcurrentSnapshotAdmission() {
+  auto budget = std::make_shared<vision::AdmissionBudget>(100, 80);
+  qfn::SnapshotAdmission snapshots(budget, 0);
+  std::barrier rendezvous(3);
+  std::atomic<unsigned> admitted{}, refused{};
+  const auto contender = [&](bool image) {
+    rendezvous.arrive_and_wait();
+    gufo::cache::ResourceReservation reservation;
+    try {
+      reservation = image ? budget->Reserve(20) : snapshots.Reserve(20, false);
+      ++admitted;
+    } catch (const gufo::core::ResourceAdmissionError&) {
+      ++refused;
+    }
+    // Hold the winner's reservation until both admission attempts completed.
+    rendezvous.arrive_and_wait();
+  };
+  std::thread image(contender, true);
+  std::thread copy(contender, false);
+  rendezvous.arrive_and_wait();
+  rendezvous.arrive_and_wait();
+  image.join();
+  copy.join();
+  Require(
+      admitted == 1 && refused == 1 && budget->Outstanding() == 0,
+      "concurrent images and private snapshots cannot spend the same bytes");
+}
 }  // namespace
 
 int main() {
   RecordedComponents();
   ModesAndGrowth();
+  SnapshotAdmissionOwnership();
+  SnapshotAdmissionFailuresAndModes();
+  ConcurrentSnapshotAdmission();
   std::cout << "Flash-Next production memory components passed\n";
 }

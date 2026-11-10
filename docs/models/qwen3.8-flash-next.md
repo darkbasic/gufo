@@ -80,19 +80,23 @@ another location. Images work the same way as for
 [Qwen3.8 27B](qwen3.8-27b.md#images), with AR and MTP.
 
 Serving reserves worst-case image state for every session by default. For
-mostly text traffic, add `--vision-memory-bytes 4294967296` to `gufo serve llm`
-to use one shared 4 GiB image budget. Text sessions retain their full context
-and MTP state; prepared image requests reserve their additional memory before
-device allocation. Requests exceeding the shared budget return HTTP 503
-`resource_exhausted`. The projector remains loaded.
+mostly text traffic, add `--vision-memory-policy on-demand` to `gufo serve llm`.
+Text sessions retain their full context and MTP state. Image requests reserve
+additional memory for history, positions, encoder work and replacement peaks
+before allocation. The projector remains loaded; requests that cannot fit
+return `resource_exhausted`. Retained buffers keep their reservation until freed.
 
-The budget includes image history, position buffers and encoder work. Retained
-image buffers keep their reservation until released; a text transition releases
-them. Concurrent image requests can therefore be refused even if each fits
-alone. An explicit RAM checkpoint-cache budget must still be granted in full.
-Other providers keep their own admission policy. Omit the option or use
-`--vision-memory-bytes 0` to select conservative admission. A deployment launcher
-must forward this option to the native `serve llm` command.
+On-demand admission protects the full configured RAM-cache allowance with lazy
+backing; images cannot borrow its unused capacity. Concurrent requests may
+refuse even if each fits alone. It does not guarantee that your session count
+fits physical memory. A launcher must forward `--vision-memory-policy on-demand`
+and omit `--vision-memory-bytes`.
+
+Omit both options or select `--vision-memory-policy conservative` to restore
+conservative admission. `--vision-memory-bytes 0` also means conservative;
+a positive byte count alone selects a fixed shared image pool. On-demand
+rejects any byte option, and explicit conservative rejects a positive pool.
+Other providers keep their own admission policy.
 
 Hardware capacity and numerical image correctness require the separate
 [GPU validation procedure](../internal/models/qwen3.8-flash-next/VISION-MEMORY-VALIDATION.md).

@@ -10,6 +10,9 @@ namespace gufo::models::qwen::vision {
 static_assert(sizeof(DeviceRope) <= 64);
 namespace {
 void Check(hipError_t error) {
+  if (error == hipErrorMemoryAllocation)
+    throw core::ResourceAdmissionError(
+        "vision memory admission refused: reason=allocation_failure");
   if (error != hipSuccess)
     throw std::runtime_error(hipGetErrorString(error));
 }
@@ -31,7 +34,8 @@ void DeviceInput::SetMemoryAdmission(std::shared_ptr<AdmissionBudget> budget) {
 }
 
 void DeviceInput::ReserveRequest(const Prompt* prompt, const Encoder* encoder,
-                                 std::size_t prefix_rows, bool replacement) {
+                                 std::size_t prefix_rows, bool replacement,
+                                 bool reuse_embeddings, bool layout_work) {
   if (!admission_budget_)
     return;
   if (prefix_rows == 0 && (!prompt || prompt->images.empty()))
@@ -45,39 +49,105 @@ void DeviceInput::ReserveRequest(const Prompt* prompt, const Encoder* encoder,
       images.push_back({image.pixels->width, image.pixels->height});
     }
   }
+  const bool on_demand = admission_budget_->OnDemand();
   const auto required =
-      RequestMemoryBytes(std::max(capacity_, prefix_rows), images,
-                         encoder ? encoder->OutputWidth() : 0);
+      on_demand ? OnDemandBytes(prompt, encoder, prefix_rows, reuse_embeddings,
+                                layout_work)
+                : RequestMemoryBytes(std::max(capacity_, prefix_rows), images,
+                                     encoder ? encoder->OutputWidth() : 0);
   // Count the old physical buffers as well as the complete replacement.
   // This deliberately overestimates the free-before-grow position path and
   // makes partial allocation/copy failures safe without transactional HIP
-  // allocation. Keep this high-water claim until image storage is released.
+  // allocation. On-demand admission settles this peak after successful work.
   auto retained = Bytes() - (descriptor_ ? sizeof(DeviceRope) : 0);
-  if (replacement && prompt_) {
+  if (replacement && prompt_ &&
+      (!on_demand || prompt_->memory_admission.lock() != admission_budget_)) {
     // This input keeps the old attachment until Configure replaces it. Its
     // resized host pixels can coexist with the new request.
     for (const auto& image : prompt_->images)
       if (image.pixels)
-        retained = CheckedAdd(retained, image.pixels->pixels.size());
+        retained =
+            CheckedAdd(retained, on_demand ? image.pixels->pixels.capacity()
+                                           : image.pixels->pixels.size());
   }
-  const auto requested =
-      replacement ? CheckedAdd(required, retained) : required;
+  // A layout-only restore keeps the same embeddings and frees positions
+  // before growing them. It does not create another complete image state.
+  const auto requested = replacement && (!on_demand || !reuse_embeddings)
+                             ? CheckedAdd(required, retained)
+                             : required;
   try {
     admission_.Grow(requested);
   } catch (const core::ResourceAdmissionError& error) {
     server::Logger::Warn(
-        "vision", "event=vision_admission_refused policy=request-aware " +
-                      std::string(error.what()));
+        "vision", "event=vision_admission_refused policy=" +
+                      std::string(on_demand ? "on-demand" : "request-aware") +
+                      " " + error.what());
     throw;
   }
   server::Logger::Debug(
       "vision",
-      "event=vision_admitted policy=request-aware claim_bytes=" +
-          std::to_string(admission_.Bytes()) +
+      "event=vision_admitted policy=" +
+          std::string(on_demand ? "on-demand" : "request-aware") +
+          " claim_bytes=" + std::to_string(admission_.Bytes()) +
+          " committed_device_bytes=" +
+          std::to_string(Bytes() - (descriptor_ ? sizeof(DeviceRope) : 0)) +
+          " protected_epoch_bytes=" +
+          std::to_string(admission_budget_->ProtectedBytes()) +
           " request_bytes=" + std::to_string(required) + " retained_bytes=" +
           std::to_string(retained) + " outstanding_bytes=" +
           std::to_string(admission_budget_->Outstanding()) +
           " capacity_bytes=" + std::to_string(admission_budget_->Capacity()));
+}
+
+std::size_t DeviceInput::OnDemandBytes(const Prompt* prompt,
+                                       const Encoder* encoder,
+                                       std::size_t prefix_rows,
+                                       bool reuse_embeddings,
+                                       bool layout_work) const {
+  auto bytes = CheckedMultiply(std::max(capacity_, prefix_rows),
+                               3 * sizeof(std::int32_t));
+  if (layout_work)
+    bytes = CheckedAdd(bytes,
+                       CheckedMultiply(prefix_rows, 3 * sizeof(std::int32_t)));
+  std::size_t scratch = 0;
+  if (prompt) {
+    const bool pixels_reserved =
+        prompt->memory_admission.lock() == admission_budget_;
+    for (std::size_t index = 0; index < prompt->images.size(); ++index) {
+      const auto& image = prompt->images[index];
+      if (!image.pixels || !encoder)
+        throw std::invalid_argument("image input has no pixels or encoder");
+      const ImageDimensions dimensions{image.pixels->width,
+                                       image.pixels->height};
+      const auto expected =
+          ImageEmbeddingBytes(dimensions, encoder->OutputWidth());
+      const bool encoded =
+          reuse_embeddings && index < embeddings_.size() && embeddings_[index];
+      // Retained buffers use their physical dimensions. Unencoded history
+      // keeps its future output and largest serial encoder work funded.
+      bytes = CheckedAdd(
+          bytes, encoded ? CheckedMultiply(
+                               CheckedMultiply(embeddings_[index]->rows(),
+                                               embeddings_[index]->width()),
+                               sizeof(float))
+                         : expected);
+      if (!pixels_reserved)
+        bytes = CheckedAdd(bytes, image.pixels->pixels.capacity());
+      if (!encoded)
+        scratch = std::max(scratch, ImageScratchBytes(dimensions));
+    }
+  }
+  return CheckedAdd(bytes, scratch);
+}
+
+void DeviceInput::SettleRequest() {
+  if (!admission_budget_ || !admission_budget_->OnDemand())
+    return;
+  // ApplyLayout has synchronized and destroyed its host positions. Encode
+  // has synchronized and destroyed scratch before returning its embedding.
+  // Missing embeddings remain an obligation, including restored history.
+  admission_.Shrink(
+      OnDemandBytes(prompt_.get(), encoder_.get(), capacity_, true, false));
 }
 
 void DeviceInput::ReleaseImageStorage(hipStream_t stream) {
@@ -92,7 +162,10 @@ void DeviceInput::ReleaseImageStorage(hipStream_t stream) {
   admission_.Clear();
   server::Logger::Debug(
       "vision",
-      "event=vision_released policy=request-aware outstanding_bytes=" +
+      "event=vision_released policy=" +
+          std::string(admission_budget_->OnDemand() ? "on-demand"
+                                                    : "request-aware") +
+          " outstanding_bytes=" +
           std::to_string(admission_budget_->Outstanding()) +
           " capacity_bytes=" + std::to_string(admission_budget_->Capacity()));
 }
@@ -124,8 +197,12 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
     prompt->rope.Validate(std::numeric_limits<std::int32_t>::max());
   if (admission_budget_ && is_cancelled_ && is_cancelled_())
     throw std::runtime_error("vision encoding cancelled");
-  ReserveRequest(prompt.get(), encoder.get(),
-                 prompt ? prompt->rope.PrefixLength() : 0, !reuse);
+  const RopeLayout empty;
+  const auto& incoming = prompt ? prompt->rope : empty;
+  const bool layout_work = !layout_ready_ || incoming != layout_ ||
+                           (descriptor_ == nullptr && !incoming.images.empty());
+  ReserveRequest(prompt.get(), encoder.get(), incoming.PrefixLength(), !reuse,
+                 reuse, layout_work);
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
   if (!reuse)
@@ -136,6 +213,8 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   if (admission_budget_ && (!prompt_ || prompt_->images.empty()) &&
       layout_.images.empty())
     ReleaseImageStorage(stream);
+  else
+    SettleRequest();
 }
 
 void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
@@ -144,9 +223,11 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
       (descriptor_ == nullptr && !layout.images.empty())) {
     // RAM and disk restores require the attached history before rebuilding
     // positions. Reserve before any layout-dependent allocation or mutation.
-    ReserveRequest(prompt_.get(), encoder_.get(), layout.PrefixLength(), true);
+    ReserveRequest(prompt_.get(), encoder_.get(), layout.PrefixLength(), true,
+                   true, true);
   }
   ApplyLayout(layout, stream);
+  SettleRequest();
 }
 
 void DeviceInput::ApplyLayout(const RopeLayout& layout, hipStream_t stream) {
@@ -202,8 +283,10 @@ void DeviceInput::Inject(float* hidden, std::uint32_t position,
     const auto end = std::min(position + count, image_end);
     if (begin >= end)
       continue;
-    if (!embeddings_[index])
+    if (!embeddings_[index]) {
       embeddings_[index] = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+      SettleRequest();
+    }
     const auto& embedding = *embeddings_[index];
     if (embedding.width() != width ||
         embedding.rows() != image.grid.height * image.grid.width) {

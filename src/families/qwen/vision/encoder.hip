@@ -37,10 +37,16 @@ constexpr unsigned kPatchDim = kEncoderPatchDim;
 constexpr unsigned kThreads = 256;
 
 void Check(hipError_t error) {
+  if (error == hipErrorMemoryAllocation)
+    throw core::ResourceAdmissionError(
+        "vision memory admission refused: reason=allocation_failure");
   if (error != hipSuccess)
     throw std::runtime_error(hipGetErrorString(error));
 }
 void CheckBlas(hipblasStatus_t status) {
+  if (status == HIPBLAS_STATUS_ALLOC_FAILED)
+    throw core::ResourceAdmissionError(
+        "vision memory admission refused: reason=allocation_failure");
   if (status != HIPBLAS_STATUS_SUCCESS) {
     throw std::runtime_error("vision hipBLAS failure: " +
                              std::to_string(status));

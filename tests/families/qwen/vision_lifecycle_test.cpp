@@ -101,6 +101,25 @@ std::size_t PeakBytes(const std::shared_ptr<vision::AdmissionBudget>& owner) {
   const std::lock_guard lock(mutex);
   return peaks[owner];
 }
+void TrackHost(void* pointer, std::size_t bytes,
+               const std::shared_ptr<vision::AdmissionBudget>& owner) {
+  const std::lock_guard lock(mutex);
+  CheckClaim(owner, bytes);
+  Require(
+      allocations
+          .emplace(pointer, Allocation{bytes, owner, AllocationKind::kDynamic})
+          .second,
+      "prepared host allocation is registered once");
+  peaks[owner] =
+      std::max(peaks[owner], LiveBytes(owner, AllocationKind::kDynamic));
+}
+void UntrackHost(void* pointer) {
+  const std::lock_guard lock(mutex);
+  const auto found = allocations.find(pointer);
+  Require(found != allocations.end(), "prepared host allocation is owned");
+  CheckClaim(found->second.owner);
+  allocations.erase(found);
+}
 hipError_t Allocate(void** pointer, std::size_t bytes, AllocationKind kind) {
   if (Fail(fail_malloc))
     return hipErrorMemoryAllocation;
@@ -248,6 +267,34 @@ std::shared_ptr<vision::Prompt> Prompt(std::uint32_t offset = 2,
   prompt->rope.images.push_back(grid);
   prompt->cache_identity = {static_cast<std::uint8_t>(offset),
                             static_cast<std::uint8_t>(side)};
+  return prompt;
+}
+std::shared_ptr<vision::Prompt> AdmittedPrompt(
+    const std::shared_ptr<vision::AdmissionBudget>& budget,
+    std::uint32_t offset = 2, std::uint32_t side = 32) {
+  // The production preparation owner reserves before decoding and aliases the
+  // prepared image pointers. Use tiny already-sized pixels here and track their
+  // real allocation alongside the simulated device allocations in that same
+  // budget.
+  struct Owner {
+    gufo::cache::ResourceReservation admission;
+    std::shared_ptr<const gufo::core::Image> pixels;
+    Owner(const std::shared_ptr<vision::AdmissionBudget>& budget,
+          std::shared_ptr<const gufo::core::Image> image)
+        : admission(budget->Reserve(image->pixels.capacity())),
+          pixels(std::move(image)) {
+      fake::TrackHost(const_cast<std::uint8_t*>(pixels->pixels.data()),
+                      pixels->pixels.capacity(), budget);
+    }
+    ~Owner() {
+      Require(pixels.use_count() == 1,
+              "last image alias frees pixels before releasing its reservation");
+      fake::UntrackHost(const_cast<std::uint8_t*>(pixels->pixels.data()));
+    }
+  };
+  auto prompt = Prompt(offset, side);
+  auto owner = std::make_shared<Owner>(budget, prompt->images.front().pixels);
+  prompt->RetainPixels(owner, budget);
   return prompt;
 }
 std::size_t Peak(const vision::Prompt& prompt) {
@@ -534,9 +581,12 @@ void Cancellation() {
           "cancelled request cleanup");
 }
 
-void ConcurrentInputs() {
+void ConcurrentInputs(bool on_demand = false) {
   const auto prompt = Prompt();
-  auto budget = std::make_shared<vision::AdmissionBudget>(Peak(*prompt));
+  auto budget = on_demand
+                    ? std::make_shared<vision::AdmissionBudget>(
+                          4096 + Peak(*prompt), 4096)
+                    : std::make_shared<vision::AdmissionBudget>(Peak(*prompt));
   fake::budget = budget;
   auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
   std::barrier start(3);
@@ -559,14 +609,249 @@ void ConcurrentInputs() {
   std::thread first(request), second(request);
   start.arrive_and_wait();
   attempted.wait();
-  Require(
-      admitted == 1 && refused == 1 && budget->Outstanding() == Peak(*prompt),
-      "actual concurrent Configure paths cannot oversubscribe the pool");
+  const auto settled =
+      Peak(*prompt) -
+      (on_demand ? prompt->rope.PrefixLength() * 3 * sizeof(std::int32_t) : 0);
+  Require(admitted == 1 && refused == 1 && budget->Outstanding() == settled,
+          "actual concurrent Configure paths cannot oversubscribe the pool");
   release.count_down();
   first.join();
   second.join();
   Require(!fake::Bytes() && !budget->Outstanding(),
           "concurrent input lifetimes release exactly once");
+}
+
+void OnDemandRetentionAndOwnership() {
+  constexpr std::size_t protected_bytes = 4096;
+  const auto unowned = Prompt();
+  const auto capacity = Peak(*unowned);
+  auto budget = std::make_shared<vision::AdmissionBudget>(
+      protected_bytes + capacity, protected_bytes);
+  fake::budget = budget;
+  auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
+  auto prompt = AdmittedPrompt(budget);
+  const auto pixel_bytes = prompt->images.front().pixels->pixels.size();
+  // A value copy retains the pixel reservation after the original prompt
+  // dies. A weak budget marker without pixel-owned tickets misses this case.
+  prompt = std::make_shared<vision::Prompt>(*prompt);
+  Require(budget->Outstanding() == pixel_bytes &&
+              fake::DynamicBytes(budget) == pixel_bytes,
+          "copied prepared prompt retains pixel ownership and accounting");
+  const auto position_bytes =
+      prompt->rope.PrefixLength() * 3 * sizeof(std::int32_t);
+  const auto embedding_bytes = std::size_t{kWidth} * sizeof(float);
+  const auto scratch = vision::ImageScratchBytes({32, 32});
+  {
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(budget);
+    input.Configure(prompt, encoder, nullptr);
+    Require(
+        budget->Outstanding() ==
+            pixel_bytes + position_bytes + embedding_bytes + scratch,
+        "on-demand drops completed host layout work, funds future encoding, "
+        "and charges prepared pixels once");
+    Inject(input, 2);
+    const auto retained = pixel_bytes + position_bytes + embedding_bytes;
+    Require(budget->Outstanding() == retained &&
+                fake::DynamicBytes(budget) == retained,
+            "on-demand releases encoder peak only after scratch is freed");
+    // Spend every newly available byte. A same-layout image continuation must
+    // reuse retained embeddings without trying to reacquire encoder scratch.
+    auto competing = budget->Reserve(capacity - retained);
+    const auto encodes = fake::encodes.load();
+    input.Configure(prompt, encoder, nullptr);
+    input.RestoreLayout(prompt->rope, nullptr);
+    Inject(input, 2);
+    Require(fake::encodes == encodes && budget->Outstanding() == capacity,
+            "exact-full budget still permits already-funded image reuse");
+    input.RestoreLayout({}, nullptr);
+    Require(fake::DynamicBytes(budget) == retained,
+            "restoring an earlier frontier retains actual image capacity");
+    Refused<gufo::core::ResourceAdmissionError>(
+        [&] { input.RestoreLayout(prompt->rope, nullptr); });
+    Require(
+        fake::DynamicBytes(budget) == retained,
+        "restore refuses missing temporary position capacity before change");
+    competing = {};
+    input.RestoreLayout(prompt->rope, nullptr);
+    Require(
+        budget->Outstanding() == retained,
+        "restore releases temporary host positions after synchronized upload");
+    // The queued/request owner can disappear; the session attachment keeps
+    // both prepared pixels and their independent reservation alive.
+    prompt.reset();
+    Require(budget->Outstanding() == retained,
+            "retained prompt alias owns pixels after request completion");
+    input.Configure(nullptr, encoder, nullptr);
+    EmptyDescriptor(input);
+    Require(!budget->Outstanding() && !fake::DynamicBytes(budget),
+            "text reset frees both prompt-owned and device-owned allocations");
+  }
+  Require(!fake::Bytes(), "on-demand descriptor shutdown");
+}
+
+void CopiedPreparedPixels() {
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>((2U << 20) + 4096, 4096);
+  {
+    auto prompt = Prompt();
+    const auto original = prompt->images.front().pixels;
+    Refused<std::invalid_argument>([&] { prompt->RetainPixels({}, budget); });
+    Require(
+        prompt->images.front().pixels == original &&
+            prompt->memory_admission.expired() && !budget->Outstanding(),
+        "missing reservation owner cannot mark uncharged pixels as admitted");
+  }
+  {
+    auto prompt = AdmittedPrompt(budget);
+    auto image = prompt->images.front().pixels;
+    const auto bytes = image->pixels.capacity();
+    prompt.reset();
+    Require(
+        budget->Outstanding() == bytes && fake::DynamicBytes(budget) == bytes,
+        "an individual image copy owns pixels and ticket without a prompt");
+  }
+  Require(!budget->Outstanding() && !fake::Bytes(),
+          "last image pointer frees its physical pixels and reservation");
+  {
+    auto source = AdmittedPrompt(budget);
+    auto destination = AdmittedPrompt(budget, 4, 64);
+    const std::weak_ptr<const gufo::core::Image> replaced =
+        destination->images.front().pixels;
+    const auto bytes = source->images.front().pixels->pixels.capacity();
+    *destination = *source;
+    source.reset();
+    Require(
+        replaced.expired() && budget->Outstanding() == bytes &&
+            fake::DynamicBytes(budget) == bytes,
+        "prompt copy assignment releases replaced pixels before their ticket");
+    vision::Prompt moved;
+    moved = std::move(*destination);
+    destination.reset();
+    Require(
+        budget->Outstanding() == bytes && fake::DynamicBytes(budget) == bytes,
+        "prompt move assignment preserves the copied pixel ticket");
+  }
+  Require(
+      !budget->Outstanding() && !fake::Bytes(),
+      "assigned prepared prompts release each pixel allocation exactly once");
+}
+
+void OnDemandGrowthHistoryAndFailures() {
+  constexpr std::size_t protected_bytes = 4096;
+  auto budget = std::make_shared<vision::AdmissionBudget>(
+      protected_bytes + (2U << 20), protected_bytes);
+  fake::budget = budget;
+  auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
+  const auto small = Prompt();
+  const auto large = Prompt(2, 64);
+  {
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(budget);
+    input.Configure(small, encoder, nullptr);
+    Inject(input, 2);
+    const auto old_retained = budget->Outstanding();
+    input.Configure(large, encoder, nullptr);
+    const auto large_position =
+        large->rope.PrefixLength() * 3 * sizeof(std::int32_t);
+    const auto large_pixels = large->images[0].pixels->pixels.size();
+    const auto large_embedding = 4 * std::size_t{kWidth} * sizeof(float);
+    Require(
+        budget->Outstanding() == large_position + large_pixels +
+                                     large_embedding +
+                                     vision::ImageScratchBytes({64, 64}),
+        "replacement releases old buffers and host-layout peak after mutation");
+    Inject(input, 2, 4);
+    Require(
+        budget->Outstanding() ==
+                large_position + large_pixels + large_embedding &&
+            budget->Outstanding() > old_retained,
+        "grown retained storage remains charged after encoder scratch ends");
+    input.Configure(nullptr, encoder, nullptr);
+  }
+  // Repeated image pixels produce separate embedding rows in the history.
+  // Encoding the first image cannot release work still needed by the second.
+  const auto history = Prompt();
+  const vision::ImageGrid second{3, 1, 1};
+  history->images.push_back({history->images.front().pixels, second, {}});
+  history->rope.images.push_back(second);
+  {
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(budget);
+    input.Configure(history, encoder, nullptr);
+    const auto prepared = budget->Outstanding();
+    Inject(input, 2);
+    Require(
+        budget->Outstanding() == prepared,
+        "first image keeps the remaining history encoder obligation funded");
+    Inject(input, 3);
+    Require(
+        budget->Outstanding() == prepared - vision::ImageScratchBytes({32, 32}),
+        "last history encoding releases the serial encoder scratch bound");
+    input.Configure(nullptr, encoder, nullptr);
+  }
+  // Production Configure/RestoreLayout are shared by RAM and disk attachment.
+  // A fresh session must reserve the complete missing history again.
+  {
+    vision::DeviceInput restored;
+    restored.SetMemoryAdmission(budget);
+    restored.Configure(history, encoder, nullptr);
+    restored.RestoreLayout(history->rope, nullptr);
+    const auto before = budget->Outstanding();
+    fake::fail_encode_after_allocation = true;
+    Refused<std::bad_alloc>([&] { Inject(restored, 2); });
+    Require(budget->Outstanding() == before &&
+                fake::DynamicBytes(budget) ==
+                    restored.Bytes() - sizeof(vision::DeviceRope),
+            "failed encode frees temporaries but retains retry/history "
+            "obligations");
+    restored.SetCancellationCheck([] { return true; });
+    Refused([&] { Inject(restored, 2); });
+    Require(budget->Outstanding() == before,
+            "cancelled encoding cannot uncharge retained restored history");
+    restored.SetCancellationCheck({});
+    Inject(restored, 2, 2);
+    restored.Configure(nullptr, encoder, nullptr);
+  }
+  Require(!fake::Bytes() && !budget->Outstanding(),
+          "on-demand history, restoration and failed encoding clean up");
+  // A changed layout may fail after freeing its old position buffer. Its
+  // peak stays funded until recovery rewrites the descriptor and releases it.
+  {
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(budget);
+    input.Configure(small, encoder, nullptr);
+    Inject(input, 2);
+    fake::fail_copy = 0;
+    Refused([&] { input.Configure(large, encoder, nullptr); });
+    Require(budget->Outstanding() >= fake::DynamicBytes(budget),
+            "failed replacement keeps aggregate retained allocations covered");
+    input.Configure(nullptr, encoder, nullptr);
+    EmptyDescriptor(input);
+    Require(!budget->Outstanding(),
+            "failed replacement resets without a leaked peak");
+  }
+  Require(!fake::Bytes(), "on-demand failed replacement descriptor shutdown");
+  {
+    vision::DeviceInput input;
+    input.SetMemoryAdmission(budget);
+    fake::fail_malloc = 1;  // Descriptor succeeds; position allocation fails.
+    try {
+      input.Configure(small, encoder, nullptr);
+      throw std::runtime_error("expected physical allocation refusal");
+    } catch (const gufo::core::ResourceAdmissionError& error) {
+      Require(std::string(error.what()).find("reason=allocation_failure") !=
+                  std::string::npos,
+              "physical HIP OOM uses the scheduler's resource error path");
+    }
+    input.Configure(nullptr, encoder, nullptr);
+    EmptyDescriptor(input);
+    Require(!budget->Outstanding(), "physical OOM releases claims on reset");
+    input.Configure(small, encoder, nullptr);
+    Inject(input, 2);
+  }
+  Require(!fake::Bytes() && !budget->Outstanding(),
+          "a later request succeeds after physical allocation refusal");
 }
 }  // namespace
 
@@ -578,5 +863,9 @@ int main() {
   AllocationAndCopyFailures();
   Cancellation();
   ConcurrentInputs();
+  ConcurrentInputs(true);
+  OnDemandRetentionAndOwnership();
+  CopiedPreparedPixels();
+  OnDemandGrowthHistoryAndFailures();
   std::cout << "vision production lifecycle checks passed (simulated HIP)\n";
 }
