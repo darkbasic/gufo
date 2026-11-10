@@ -2,9 +2,9 @@
 
 Title: `fix(qwen): admit vision memory from a shared request budget`
 
-Fixes #920.
+Addresses #920; the recorded four-session deployment remains over budget.
 
-Required PR label: `ext-api` (additive component-cache backing hook).
+Required PR label: `ext-api` (additive component-cache backing and memory-snapshot interfaces).
 
 Flash-Next reserves a context-sized image embedding/position allowance for every
 execution session whenever its vision projector is loaded. At 262,144 tokens
@@ -38,10 +38,18 @@ operators and persistent checkpoint representations are unchanged. The additive
 `ComponentCacheHooks::require_full_backing` contract defaults to false for
 existing providers and has its own extension API change record.
 
-With the issue's estimates, four base claims including the descriptor total
-30,108,435,792 bytes. Adding a shared 4 GiB vision pool, the unchanged 4 GiB RAM
-cache and 512 MiB margin totals 39,235,241,296 bytes, below the reported capacity.
-This establishes admission eligibility only; actual GPU capacity is unverified.
+The later ZBook event selects 34,672,033,792 bytes against a complete remaining
+requirement of 39,653,254,480 bytes. The new deterministic regression requires
+the unchanged 4,981,220,688-byte refusal. The audit found no justified savings;
+even making the whole vision pool lazy would leave 686,253,392 bytes missing.
+See the [admission audit](VISION-MEMORY-ADMISSION.md) for the exact components
+and ownership findings. No four-session fit is claimed.
+
+Collect the host/device inputs once after fingerprinting and share them between
+copy-width selection and final admission. One event exposes both limits, their
+CMA/cgroup/reserve calculation, loaded allocation ownership, uncommitted claims
+and the deficit. Production host and per-session calculations are shared with
+CPU tests, preserving the previous totals and safety reserves.
 
 Validation uses production host accounting and DeviceInput lifecycle code with
 simulated HIP allocations, plus shared scheduler/cache and provider-option
@@ -49,9 +57,10 @@ regressions. Coverage includes default/opt-in behavior, exact boundaries,
 overflow, simultaneous reservations, history, retained growth, reset,
 cancellation, allocation failures and RAM/disk restoration. The standalone
 accounting tests pass under GCC and ASan/UBSan. The complete CPU build succeeds;
-the native PR gate passes all 114 tests in 57.79 seconds. Six CPU tests of the
-hardware harness also pass. See the [VM test report](VISION-MEMORY-TESTS.md)
-for commands, limits and paths not compiled with HIP.
+the initial native PR gate passed all 114 tests in 57.79 seconds. Those results
+predate this follow-up. The final admission follow-up passed nine focused CPU
+regressions and 21 harness tests; see its [commands and limits](VISION-MEMORY-ADMISSION.md#validation-scope).
+The [initial VM test report](VISION-MEMORY-TESTS.md) retains the earlier evidence.
 
 The [owner-run procedure](VISION-MEMORY-VALIDATION.md) retains separate-port
 four-session execution evidence, full cache grants, image success/refusal,

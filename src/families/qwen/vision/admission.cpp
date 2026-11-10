@@ -127,9 +127,32 @@ void AdmissionLease::Clear() noexcept {
   bytes_ = 0;
 }
 
+const char* StartupCapacity::LimiterName() const noexcept {
+  if (device_admission_bytes == host_ceiling_bytes)
+    return "equal";
+  return device_admission_bytes < host_ceiling_bytes ? "device" : "host";
+}
+
+StartupCapacity SelectStartupCapacity(std::size_t device_admission_bytes,
+                                      std::size_t host_ceiling_bytes) {
+  return {device_admission_bytes, host_ceiling_bytes,
+          std::min(device_admission_bytes, host_ceiling_bytes)};
+}
+
 bool StartupMemoryPlan::Fits(std::size_t sessions) const noexcept {
   return !per_session_bytes ||
          sessions <= state_capacity_bytes / per_session_bytes;
+}
+
+std::size_t StartupMemoryPlan::RequiredBytes(std::size_t sessions) const {
+  return CheckedAdd(CheckedMultiply(per_session_bytes, sessions),
+                    shared_reservation_bytes);
+}
+
+std::size_t StartupMemoryPlan::DeficitBytes(std::size_t sessions,
+                                            std::size_t available) const {
+  const auto required = RequiredBytes(sessions);
+  return required > available ? required - available : 0;
 }
 
 StartupMemoryPlan PlanStartupMemory(std::size_t available_bytes,

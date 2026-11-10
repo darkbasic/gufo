@@ -22,7 +22,9 @@ Before starting the harness or any model-dependent check, the owner must:
 2. Drain production chat requests, stop its model-serving process using the
    normal operational procedure, and verify its model memory has been released.
    Keep the required auxiliary services running with their normal configuration;
-   stopping them would invalidate the target memory-budget test.
+   this includes EmbeddingGemma 2 on the same APU and Open WebUI. Stopping them
+   would invalidate the target memory-budget test. Leave HugeTLB and GTT/TTM
+   settings unchanged.
 3. Leave production model files, configuration, launcher and checkpoint caches
    untouched. Use only the candidate binary, separate port and newly created
    disposable cache specified below.
@@ -65,16 +67,61 @@ export GUFO_BINARY=/absolute/path/to/candidate/gufo
 export GUFO_MODEL=/absolute/path/to/first-UD-Q4_K_XL-shard.gguf
 export GUFO_MTP=/absolute/path/to/mtp-shared-Q8_0.gguf
 export GUFO_PROJECTOR=/absolute/path/to/mmproj-BF16.gguf
+export GUFO_VALIDATION_PARENT=/absolute/path/on/a/disk/filesystem
+case "$(findmnt -n -o FSTYPE -T "$GUFO_VALIDATION_PARENT")" in
+  tmpfs|ramfs|"") echo "Choose an existing disk-backed validation directory" >&2; exit 1 ;;
+esac
 export GUFO_VALIDATION_ROOT
-GUFO_VALIDATION_ROOT=$(mktemp -d /tmp/gufo-vision-validation.XXXXXXXX)
+GUFO_VALIDATION_ROOT=$(mktemp -d "$GUFO_VALIDATION_PARENT/gufo-vision-validation.XXXXXXXX")
 "$GUFO_BINARY" --version > "$GUFO_VALIDATION_ROOT/version.txt"
-"$GUFO_BINARY" diagnose > "$GUFO_VALIDATION_ROOT/diagnose.txt"
 git rev-parse HEAD > "$GUFO_VALIDATION_ROOT/source-revision.txt"
 ```
 
 Record the build toolchain, weight revisions/hashes, GPU/driver version and
 other processes' memory use. The harness records its command and source hash,
 but does not hash all multi-gigabyte model shards automatically.
+
+## Targeted admission follow-up
+
+For the [recorded refusal](VISION-MEMORY-ADMISSION.md), make **one** startup
+attempt after the maintenance steps above. The purpose is to collect the final
+HIP and host limits together and identify their limiter; the older log cannot
+answer that question. No budget or service changes are part of this attempt.
+Use an unused port. The new disposable cache is on the disk filesystem selected
+above, not tmpfs, and production cache directories remain untouched.
+
+```sh
+set -o pipefail
+"$GUFO_BINARY" serve llm \
+  --model "$GUFO_MODEL" --mtp-model "$GUFO_MTP" --mmproj "$GUFO_PROJECTOR" \
+  --host 127.0.0.1 --port 18092 \
+  --sessions 4 --context 262144 --speculative mtp --draft-tokens 7 \
+  --cache-ram-bytes 4294967296 --cache-disk-bytes 53687091200 \
+  --cache-disk "$GUFO_VALIDATION_ROOT/admission-cache" \
+  --vision-memory-bytes 4294967296 \
+  --think auto --reasoning-effort xhigh --preserve-thinking on \
+  2>&1 | tee "$GUFO_VALIDATION_ROOT/admission.log"
+GUFO_ADMISSION_EXIT=${PIPESTATUS[0]}
+printf '%s\n' "$GUFO_ADMISSION_EXIT" > "$GUFO_VALIDATION_ROOT/exit-status.txt"
+```
+
+Retain the single `event=vision_admission` line with
+`phase=post_fingerprint_pre_sessions`, together with the exit status. Check its
+raw HIP free, device admission budget, raw host/CMA/cgroup calculation, OS
+reserve, selected limiter, loaded allocation scope and total/deficit against
+the formulas in the audit. Do not substitute `vision_prepared` or
+`load_failed` readings. The old measured capacity must still refuse by
+4,981,220,688 bytes with this patch; no saving is assumed.
+
+On refusal, stop this validation attempt and return that evidence. Do not
+repeat full loads, clear caches or disable auxiliary services to seek a pass.
+If changed external memory availability permits readiness, retain the event
+and stop only this owned candidate with Ctrl-C when finished; readiness alone
+does not prove four conversations can execute or that numerical outputs are
+correct. The full workload procedure below remains a separate qualification,
+pending resolution of the capacity constraint, rather than a required second
+load in this follow-up. Restore production chat through the owner's normal
+procedure after the candidate has exited. No harness stops services.
 
 ## Capacity, real concurrency, image refusal and cache lifecycle
 

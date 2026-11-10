@@ -269,19 +269,135 @@ constexpr std::size_t kMaxBatchWidth = 8;
 // existing 128 MiB preprocessing cache and bounded disk staging/metadata.
 constexpr std::size_t kVisionRuntimeMargin = 512ULL << 20;
 
+struct StartupMemorySnapshot {
+  ext::HostSnapshotMemory host;
+  hip::AdmissionMemory device;
+  qwen::vision::StartupCapacity capacity;
+  std::int64_t collection_us;
+};
+
+StartupMemorySnapshot CollectStartupMemory() {
+  const auto started = std::chrono::steady_clock::now();
+  const auto host = ext::QueryHostSnapshotMemory();
+  const auto device =
+      hip::QueryAdmissionMemoryUsingHost(host.raw_available_bytes);
+  if (!device)
+    throw core::ResourceAdmissionError(
+        "vision memory admission refused: reason=memory_query_failed");
+  return {host, *device,
+          qwen::vision::SelectStartupCapacity(device->free_bytes,
+                                              host.ceiling_bytes),
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count()};
+}
+
+void LogVisionAdmission(
+    const StartupMemorySnapshot& snapshot,
+    const std::optional<qwen::vision::StartupMemoryPlan>& plan,
+    const Model& model, core::SessionMode mode, std::uint32_t context,
+    std::size_t sessions, std::size_t vision_bytes, std::size_t cache_bytes,
+    const char* failure = "none") {
+  const auto& host = snapshot.host;
+  const auto& device = snapshot.device;
+  const auto state = model.TextSessionMemory(mode, context);
+  const auto shared = model.LoadedSharedMemory();
+  const auto number = [](std::optional<std::uint64_t> value) {
+    return value ? std::to_string(*value) : std::string("unknown");
+  };
+  std::string total_text = "overflow", total_required = "unknown",
+              deficit = "unknown";
+  bool eligible = plan && plan->Fits(sessions);
+  try {
+    total_text = std::to_string(
+        qwen::vision::CheckedMultiply(state.TotalBytes(), sessions));
+    if (plan) {
+      total_required = std::to_string(plan->RequiredBytes(sessions));
+      deficit = std::to_string(
+          plan->DeficitBytes(sessions, snapshot.capacity.available_bytes));
+    }
+  } catch (const core::ResourceAdmissionError&) {
+    total_required = deficit = "overflow";
+    failure = "arithmetic_overflow";
+    eligible = false;
+  }
+  if (plan && !eligible && std::string_view(failure) == "none")
+    failure = "text_state_capacity";
+  // Every capacity field comes from this collection after fingerprinting and
+  // before sessions/cache backing exist. Loaded requested bytes explain
+  // ownership only: they are already consumed, never credited back to free.
+  server::Logger::Info(
+      "loader",
+      "event=vision_admission policy=request-aware "
+      "phase=post_fingerprint_pre_sessions snapshot_collection_us=" +
+          std::to_string(snapshot.collection_us) +
+          " hip_free_bytes=" + std::to_string(device.hip_free_bytes) +
+          " device_admission_bytes=" + std::to_string(device.free_bytes) +
+          " device_host_margin_bytes=" +
+          std::to_string(device.local ? hip::kAdmissionHostMarginBytes : 0) +
+          " device_local_budget_bytes=" +
+          number(device.local ? std::optional{device.local->budget_bytes}
+                              : std::nullopt) +
+          " device_local_usage_bytes=" +
+          number(device.local ? std::optional{device.local->usage_bytes}
+                              : std::nullopt) +
+          " host_available_bytes=" + std::to_string(host.raw_available_bytes) +
+          " host_source=" + (host.from_meminfo ? "meminfo" : "platform") +
+          " cma_free_bytes=" + std::to_string(host.cma_free_bytes) +
+          " cma_excluded_bytes=" + std::to_string(host.cma_excluded_bytes) +
+          " cgroup_headroom_bytes=" + number(host.cgroup_headroom_bytes) +
+          " host_limiter=" + (host.cgroup_limited ? "cgroup" : "host") +
+          " host_reserve_bytes=" + std::to_string(host.reserve_bytes) +
+          " host_ceiling_bytes=" + std::to_string(host.ceiling_bytes) +
+          " selected_limiter=" + snapshot.capacity.LimiterName() +
+          " memory_capacity_bytes=" +
+          std::to_string(snapshot.capacity.available_bytes) +
+          " loaded_allocation_scope=explicit_requested_bytes "
+          "loaded_weight_bytes=" +
+          std::to_string(model.ResidentBytes()) +
+          " loaded_shared_device_bytes=" + std::to_string(shared.device_bytes) +
+          " loaded_shared_host_bytes=" + std::to_string(shared.host_bytes) +
+          " sessions=" + std::to_string(sessions) +
+          " base_bytes=" + std::to_string(state.TotalBytes()) +
+          " trunk_kv_bytes=" + std::to_string(state.trunk_kv_bytes) +
+          " trunk_index_bytes=" + std::to_string(state.trunk_index_bytes) +
+          " recurrent_bytes=" + std::to_string(state.recurrent_bytes) +
+          " rollback_bytes=" + std::to_string(state.rollback_bytes) +
+          " mtp_kv_bytes=" + std::to_string(state.mtp_kv_bytes) +
+          " mtp_index_bytes=" + std::to_string(state.mtp_index_bytes) +
+          " mtp_hidden_bytes=" + std::to_string(state.mtp_hidden_bytes) +
+          " mtp_draft_table_bytes=" +
+          std::to_string(state.mtp_draft_table_bytes) + " control_bytes=" +
+          std::to_string(state.control_bytes) + " vision_descriptor_bytes=" +
+          std::to_string(state.vision_descriptor_bytes) +
+          " state_committed_bytes=0 cache_committed_bytes=0 "
+          "vision_committed_bytes=0"
+          " outstanding_bytes=0 vision_capacity_bytes=" +
+          std::to_string(vision_bytes) + " cache_reserved_bytes=" +
+          std::to_string(cache_bytes) + " deferred_scratch_bytes=" +
+          std::to_string(model.DeferredScratchBytes()) +
+          " runtime_margin_bytes=" + std::to_string(kVisionRuntimeMargin) +
+          " uncommitted_shared_bytes=" +
+          (plan ? std::to_string(plan->shared_reservation_bytes) : "unknown") +
+          " total_text_bytes=" + total_text +
+          " total_required_bytes=" + total_required + " state_capacity_bytes=" +
+          (plan ? std::to_string(plan->state_capacity_bytes) : "0") +
+          " deficit_bytes=" + deficit + " refusal_reason=" + failure +
+          " result=" + (eligible ? "eligible" : "refused"));
+}
+
 class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
-  QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
-                          std::uint32_t max_context, bool use_mtp,
-                          std::uint32_t max_draft_tokens,
-                          std::string artifact_fingerprint = {},
-                          std::string mtp_fingerprint = {},
-                          std::size_t vision_memory_bytes = 0,
-                          std::size_t cache_reserve_bytes = 0,
-                          std::size_t required_cache_bytes = 0)
+  QwenFlashNextTextRunner(
+      std::shared_ptr<QwenFlashNextModel> model, std::uint32_t max_context,
+      bool use_mtp, std::uint32_t max_draft_tokens,
+      std::string artifact_fingerprint = {}, std::string mtp_fingerprint = {},
+      std::size_t vision_memory_bytes = 0, std::size_t cache_reserve_bytes = 0,
+      std::size_t required_cache_bytes = 0, std::size_t session_count = 1,
+      std::optional<StartupMemorySnapshot> startup_memory = {})
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
@@ -292,21 +408,30 @@ public:
       if (!model_->VisionEncoder())
         throw std::invalid_argument(
             "--vision-memory-bytes requires a vision projector");
-      const auto memory = gufo::hip::QueryAdmissionMemory();
-      if (!memory)
-        throw core::ResourceAdmissionError(
-            "vision memory admission refused: reason=memory_query_failed");
+      if (!startup_memory)
+        throw std::logic_error(
+            "request-aware admission needs a startup snapshot");
       const auto mode = use_mtp_ ? core::SessionMode::kSpeculative
                                  : core::SessionMode::kAutoregressive;
       // CPU preprocessing and device execution share the host/cgroup ceiling
       // on unified memory. Both capacities must fund the entire partition.
-      const auto available =
-          std::min<std::size_t>(memory->free_bytes, HostSnapshotCeilingBytes());
-      vision_plan_ = qwen::vision::PlanStartupMemory(
-          available, model_->DeferredScratchBytes(),
-          model_->TextSessionBytes(mode, max_context_),
-          model_->SessionBytes(mode, max_context_), vision_memory_bytes,
-          cache_reserve_bytes, kVisionRuntimeMargin);
+      const auto available = startup_memory->capacity.available_bytes;
+      try {
+        vision_plan_ = qwen::vision::PlanStartupMemory(
+            available, model_->DeferredScratchBytes(),
+            model_->TextSessionBytes(mode, max_context_),
+            model_->SessionBytes(mode, max_context_), vision_memory_bytes,
+            cache_reserve_bytes, kVisionRuntimeMargin);
+      } catch (const core::ResourceAdmissionError& error) {
+        LogVisionAdmission(
+            *startup_memory, {}, *model_, mode, max_context_, session_count,
+            vision_memory_bytes, cache_reserve_bytes,
+            std::string_view(error.what()).find("arithmetic_overflow") !=
+                    std::string_view::npos
+                ? "arithmetic_overflow"
+                : "shared_capacity");
+        throw;
+      }
       vision_budget_ =
           std::make_shared<qwen::vision::AdmissionBudget>(vision_memory_bytes);
       execution_headroom_bytes_ = qwen::vision::CheckedAdd(
@@ -315,18 +440,9 @@ public:
       // complete RAM backing commits before readiness, so later snapshots
       // must not reserve that physically committed cache a second time.
       model_->SetVisionMemoryBudget(vision_budget_, vision_memory_bytes);
-      server::Logger::Info(
-          "loader",
-          "event=vision_admission policy=request-aware base_bytes=" +
-              std::to_string(vision_plan_->per_session_bytes) +
-              " vision_capacity_bytes=" + std::to_string(vision_memory_bytes) +
-              " outstanding_bytes=0 memory_capacity_bytes=" +
-              std::to_string(available) + " state_capacity_bytes=" +
-              std::to_string(vision_plan_->state_capacity_bytes) +
-              " deferred_scratch_bytes=" +
-              std::to_string(model_->DeferredScratchBytes()) +
-              " runtime_margin_bytes=" + std::to_string(kVisionRuntimeMargin) +
-              " cache_reserved_bytes=" + std::to_string(cache_reserve_bytes));
+      LogVisionAdmission(*startup_memory, *vision_plan_, *model_, mode,
+                         max_context_, session_count, vision_memory_bytes,
+                         cache_reserve_bytes);
     }
     // The typed in-process API owns an immutable loaded model but need not
     // supply file fingerprints when disk caching is disabled. Its model
@@ -1052,15 +1168,8 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
   // the ordinary verifier width fits.
   try {
     if (std::size_t free_bytes = 0, total_bytes = 0;
-        use_mtp && hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      if (vision_memory_bytes) {
-        const auto memory = gufo::hip::QueryAdmissionMemory();
-        if (!memory)
-          throw core::ResourceAdmissionError(
-              "vision memory admission refused: reason=memory_query_failed");
-        free_bytes = std::min<std::size_t>(memory->free_bytes,
-                                           HostSnapshotCeilingBytes());
-      }
+        use_mtp && !vision_memory_bytes &&
+        hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       const std::size_t sessions =
           std::max<std::size_t>(options.session_count, 1);
       for (std::uint32_t rows = rocm::Executor::kWideRows;; rows -= 8) {
@@ -1113,11 +1222,43 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
     }
   }
   try {
+    std::optional<StartupMemorySnapshot> startup_memory;
+    if (vision_memory_bytes) {
+      // Fingerprinting's temporary MTP reader and hash buffers have finished.
+      // Copy-width choice and final admission must use this same collection,
+      // not the earlier vision-preparation or later failure-cleanup readings.
+      startup_memory = CollectStartupMemory();
+      if (use_mtp) {
+        for (std::uint32_t rows = rocm::Executor::kWideRows;; rows -= 8) {
+          model->LimitCopyRows(rows);
+          const auto mode = core::SessionMode::kSpeculative;
+          try {
+            const auto plan = qwen::vision::PlanStartupMemory(
+                startup_memory->capacity.available_bytes,
+                model->DeferredScratchBytes(),
+                model->TextSessionBytes(mode, max_context),
+                model->SessionBytes(mode, max_context), vision_memory_bytes,
+                cache_reserve, kVisionRuntimeMargin);
+            if (rows == 8 ||
+                plan.Fits(std::max<std::size_t>(options.session_count, 1)))
+              break;
+          } catch (const core::ResourceAdmissionError&) {
+            // Wider deferred work may not fit. At the minimum, constructor
+            // admission emits the same collected snapshot and preserves the
+            // resource refusal; no allocation or reservation occurs here.
+            if (rows == 8)
+              break;
+          }
+        }
+      }
+    }
     return std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context, use_mtp,
         options.speculative.max_draft_tokens, std::move(model_fingerprint),
         std::move(draft_fingerprint), vision_memory_bytes, cache_reserve,
-        options.ram_cache.enabled ? options.ram_cache.capacity_bytes : 0);
+        options.ram_cache.enabled ? options.ram_cache.capacity_bytes : 0,
+        std::max<std::size_t>(options.session_count, 1),
+        std::move(startup_memory));
   } catch (const std::exception& exception) {
     if (error)
       *error = exception.what();

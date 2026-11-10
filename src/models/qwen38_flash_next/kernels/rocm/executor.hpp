@@ -295,6 +295,13 @@ public:
   [[nodiscard]] std::size_t SessionBytes(
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
+  [[nodiscard]] SessionMemoryBreakdown SessionMemory(
+      core::SessionMode mode, std::uint32_t max_context,
+      std::uint32_t rollback_depth) const noexcept;
+  [[nodiscard]] qwen38_flash_next::LoadedSharedMemory LoadedSharedMemory()
+      const noexcept {
+    return loaded_shared_;
+  }
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   /// Configure before any sessions or snapshots exist. Private snapshot
   /// storage must leave the shared vision pool free. Serving commits its full
@@ -903,6 +910,7 @@ private:
   /// Session capacity the sparse-mask rows and score scratch are sized for:
   /// max(native context, Options::max_context).
   std::uint32_t context_capacity_{0};
+  qwen38_flash_next::LoadedSharedMemory loaded_shared_;
   /// YaRN constants every rope launch receives (disabled: original path).
   /// With dynamic YaRN they are the running session's (UseYarn).
   mutable YarnRope yarn_{};

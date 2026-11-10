@@ -19,6 +19,7 @@
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/memory.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -115,6 +116,10 @@ public:
   /// this for admission; snapshots and other callers retain SessionBytes.
   [[nodiscard]] std::size_t TextSessionBytes(
       core::SessionMode mode, std::uint32_t context) const noexcept;
+  [[nodiscard]] SessionMemoryBreakdown TextSessionMemory(
+      core::SessionMode mode, std::uint32_t context) const noexcept;
+  [[nodiscard]] qwen38_flash_next::LoadedSharedMemory LoadedSharedMemory()
+      const noexcept;
   /// Serving initialization only: prepared prompts must carry their host
   /// preparation reservation, and cache backing must commit before execution.
   void SetVisionMemoryBudget(

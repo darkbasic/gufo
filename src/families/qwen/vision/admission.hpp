@@ -108,16 +108,36 @@ private:
   std::size_t bytes_{0};
 };
 
+struct StartupCapacity {
+  std::size_t device_admission_bytes;
+  std::size_t host_ceiling_bytes;
+  std::size_t available_bytes;
+  [[nodiscard]] const char* LimiterName() const noexcept;
+};
+
+/// Both inputs describe remaining capacity at the same loading phase. Loaded
+/// weights and committed shared buffers are already reflected in these values;
+/// their accounting totals must never be added back to either observation.
+[[nodiscard]] StartupCapacity SelectStartupCapacity(
+    std::size_t device_admission_bytes, std::size_t host_ceiling_bytes);
+
 struct StartupMemoryPlan {
   std::size_t state_capacity_bytes;
   std::size_t per_session_bytes;
   std::size_t shared_reservation_bytes;
   [[nodiscard]] bool Fits(std::size_t sessions) const noexcept;
+  [[nodiscard]] std::size_t RequiredBytes(std::size_t sessions) const;
+  [[nodiscard]] std::size_t DeficitBytes(std::size_t sessions,
+                                         std::size_t available) const;
 };
 
 /// Preserve legacy admission when vision_budget is zero. Request-aware mode
-/// subtracts every shared allowance once, then tests the unchanged text/MTP
+/// subtracts every UNCOMMITTED shared allowance once, then tests text/MTP
 /// state per session. The cache grant is reserved in full, never trimmed here.
+/// Already committed allocations lower the capacity snapshot instead. For
+/// example startup DeferredScratchBytes omits existing logits/checkpoint/wide
+/// buffers. Its snapshot-spare bound is deliberately retained even at runtime;
+/// this planner does not reinterpret that owner's safety policy.
 [[nodiscard]] StartupMemoryPlan PlanStartupMemory(
     std::size_t available_bytes, std::size_t deferred_scratch,
     std::size_t base_per_session, std::size_t conservative_per_session,

@@ -303,11 +303,22 @@ std::size_t Model::DeferredScratchBytes() const {
 
 std::size_t Model::TextSessionBytes(core::SessionMode mode,
                                     std::uint32_t context) const noexcept {
-  return executor_->SessionBytes(mode, context,
-                                 mode == core::SessionMode::kSpeculative
-                                     ? executor_->max_speculative() - 1
-                                     : 0) +
-         (vision_ ? 64 : 0);
+  return TextSessionMemory(mode, context).TotalBytes();
+}
+
+SessionMemoryBreakdown Model::TextSessionMemory(
+    core::SessionMode mode, std::uint32_t context) const noexcept {
+  auto result = executor_->SessionMemory(mode, context,
+                                         mode == core::SessionMode::kSpeculative
+                                             ? executor_->max_speculative() - 1
+                                             : 0);
+  result.vision_descriptor_bytes = vision_ ? 64 : 0;
+  return result;
+}
+
+qwen38_flash_next::LoadedSharedMemory Model::LoadedSharedMemory()
+    const noexcept {
+  return executor_->LoadedSharedMemory();
 }
 
 void Model::SetVisionMemoryBudget(

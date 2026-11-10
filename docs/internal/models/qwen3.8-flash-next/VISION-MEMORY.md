@@ -5,6 +5,9 @@ request-aware within one bounded model-wide budget. Zero preserves conservative
 admission. This is an internal account of issue #920; usage is on the
 [model page](../../../models/qwen3.8-flash-next.md), and hardware qualification
 has a [separate procedure](VISION-MEMORY-VALIDATION.md).
+The [recorded ZBook admission audit](VISION-MEMORY-ADMISSION.md) supersedes the
+historical capacity estimate below: the actual target still has a
+4,981,220,688-byte deficit, with no justified savings identified by that audit.
 
 ## Root cause and estimates
 
@@ -21,9 +24,9 @@ issue's four full claims total 40,858,436,944 bytes, exceeding its reported
 40,088,076,288-byte capacity. Keeping the 64-byte stable descriptor allowance,
 four text claims instead total 30,108,435,792 bytes. A 4 GiB shared vision pool,
 the full 4 GiB RAM cache and 512 MiB runtime margin bring that estimate to
-39,235,241,296 bytes. These values demonstrate eligibility under the reported
-capacity, not observed physical usage. Actual startup additionally requires
-the current host/cgroup ceiling and all deferred scratch to fit.
+39,235,241,296 bytes. This historical arithmetic does not reproduce the later
+host/device minimum. Actual startup also requires the current host/cgroup
+ceiling and all deferred scratch; the recorded deployment fails that check.
 
 The conservative `SessionBytes()` remains unchanged. Its other consumers
 include MTP copy-width selection, native continuation probes and allocation

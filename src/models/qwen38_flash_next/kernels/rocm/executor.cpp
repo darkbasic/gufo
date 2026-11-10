@@ -149,8 +149,7 @@ std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
 
 std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
                               std::uint32_t context) {
-  return static_cast<std::uint32_t>(std::bit_ceil(std::min<std::uint64_t>(
-      context, std::uint64_t{c.indexer_top_k} + batch)));
+  return SessionIndexerCapacity(c, batch, context);
 }
 
 void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
@@ -1090,40 +1089,53 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   const std::size_t hidden = c.hidden_size;
   const std::size_t slots = T * c.num_experts_used;
   auto& a = e->allocations_;
+  const auto host = [&]<class Element>(Element** pointer, std::size_t bytes,
+                                       unsigned flags = hipHostMallocDefault) {
+    const auto status = e->host_allocations_.Allocate(pointer, bytes, flags);
+    if (status == hipSuccess)
+      e->loaded_shared_.host_bytes += bytes;
+    return status;
+  };
   Scratch& s = e->s_;
-  auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
-  s.tokens = Alloc<std::int32_t>(a, T, error_msg);
-  s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
+  auto f32 = [&](std::size_t n) {
+    return Alloc<float>(a, n, error_msg, &e->loaded_shared_.device_bytes);
+  };
+  s.tokens =
+      Alloc<std::int32_t>(a, T, error_msg, &e->loaded_shared_.device_bytes);
+  s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg,
+                                  &e->loaded_shared_.device_bytes);
   for (void*& slot : s.x_q8) {
     slot = Alloc<std::uint8_t>(
         a,
         qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch),
                            static_cast<int>(model.max_q8_cols())),
-        error_msg);
+        error_msg, &e->loaded_shared_.device_bytes);
   }
   const auto q8_1 = [&](std::size_t k) {
     return Alloc<std::uint8_t>(
         a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
-        error_msg);
+        error_msg, &e->loaded_shared_.device_bytes);
   };
   s.xn_q8_1 = q8_1(hc_dim);
   s.lo_q8_1 = q8_1(c.hc_low_rank);
   s.mixed_q8_1 = q8_1(hidden);
   s.gdn_q8_1 = q8_1(c.SsmValueDim());
   s.ctx_q8_1 = q8_1(c.AttentionQDim());
-  s.x_q8t =
-      Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
+  s.x_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()),
+                                error_msg, &e->loaded_shared_.device_bytes);
   s.res = f32(T * hc_dim);
   s.xn = f32(T * hc_dim);
-  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
-  s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
+  s.xn_half =
+      Alloc<__half>(a, T * hc_dim, error_msg, &e->loaded_shared_.device_bytes);
+  s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg,
+                                 &e->loaded_shared_.device_bytes);
   s.lo = f32(T * c.hc_low_rank);
   s.mixed = f32(T * hidden);
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
   s.hc_defer_w = f32(T * c.hc_count);
-  e->hc_fused_state_ =
-      Alloc<std::uint8_t>(a, HcMixQ8FusedStateBytes(), error_msg);
+  e->hc_fused_state_ = Alloc<std::uint8_t>(
+      a, HcMixQ8FusedStateBytes(), error_msg, &e->loaded_shared_.device_bytes);
   e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
   const std::size_t linear_projection = std::max<std::size_t>(
       c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
@@ -1187,8 +1199,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                         kAttnSplits * (c.head_dim + 2));
   s.attn_lists = Alloc<std::uint32_t>(
       a, std::size_t{kVecBatch} * (c.indexer_top_k / c.compress_ratio),
-      error_msg);
-  s.attn_counts = Alloc<std::uint32_t>(a, kVecBatch, error_msg);
+      error_msg, &e->loaded_shared_.device_bytes);
+  s.attn_counts = Alloc<std::uint32_t>(a, kVecBatch, error_msg,
+                                       &e->loaded_shared_.device_bytes);
   if (c.ple_layer >= 0) {
     // PLE finishes before this layer's mixer/SSM. Its gate consumes key
     // and query before normalization/convolution reuse those two buffers.
@@ -1206,9 +1219,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // allocation or upload. Its address stays fixed for graph replay; the
     // next-chunk prefetch uses separate storage until this forward finishes.
     void* pinned = nullptr;
-    if (!Check(e->host_allocations_.Allocate(
-                   &pinned, T * c.PleEmbeddingDim() * sizeof(float),
-                   hipHostMallocMapped | hipHostMallocCoherent),
+    if (!Check(host(&pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                    hipHostMallocMapped | hipHostMallocCoherent),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
     }
@@ -1223,16 +1235,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       ngram->ReserveGather(T * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
-  s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
+  s.ids =
+      Alloc<std::int32_t>(a, slots, error_msg, &e->loaded_shared_.device_bytes);
+  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg,
+                                         &e->loaded_shared_.device_bytes);
   {
     const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
-    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
-    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
-    s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
-    s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
+    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg,
+                                          &e->loaded_shared_.device_bytes);
+    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg,
+                                           &e->loaded_shared_.device_bytes);
+    s.rows_token = Alloc<std::int32_t>(a, compact, error_msg,
+                                       &e->loaded_shared_.device_bytes);
+    s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg,
+                                      &e->loaded_shared_.device_bytes);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg,
+                            &e->loaded_shared_.device_bytes);
   }
   s.weights = f32(slots);
   cursor = stage;
@@ -1242,36 +1261,33 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.shexp_gate = f32(T * c.shared_expert_ff);
   s.shexp_up = f32(T * c.shared_expert_ff);
   s.shexp_out = f32(T * hidden);
-  s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg);
+  s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg,
+                               &e->loaded_shared_.device_bytes);
   s.logits =
       f32(static_cast<std::size_t>(e->options_.max_logit_rows) * c.vocab_size);
   {
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(
-            e->host_allocations_.Allocate(&control, sizeof(Session::Control)),
-            "pinned control buffer", error_msg) ||
-        !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
-               "pinned token buffer", error_msg) ||
+    if (!Check(host(&control, sizeof(Session::Control)),
+               "pinned control buffer", error_msg) ||
+        !Check(host(&tokens, T * sizeof(std::int32_t)), "pinned token buffer",
+               error_msg) ||
         !Check(
-            e->host_allocations_.Allocate(
-                &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
-                             c.vocab_size * sizeof(float)),
+            host(&logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
+                              c.vocab_size * sizeof(float)),
             "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(e->host_allocations_.Allocate(
-                   &counts, c.num_experts * sizeof(std::uint32_t)),
+    if (!Check(host(&counts, c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(e->host_allocations_.Allocate(
-                   &tiles,
-                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+    if (!Check(host(&tiles,
+                    3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1294,23 +1310,25 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_embd = s.mixed;
     s.mtp_eproj = s.qkvz;
     s.mtp_res = s.res;
-    s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
+    s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg,
+                                          &e->loaded_shared_.device_bytes);
     // The draft token and its confidence (float bits), one host transfer.
-    s.mtp_token = Alloc<std::int32_t>(a, 2, error_msg);
+    s.mtp_token =
+        Alloc<std::int32_t>(a, 2, error_msg, &e->loaded_shared_.device_bytes);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *
             sizeof(PenaltyArgmaxCandidate) / sizeof(std::uint32_t));
-    s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
-    s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
+    s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg,
+                                     &e->loaded_shared_.device_bytes);
+    s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg,
+                                             &e->loaded_shared_.device_bytes);
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
-                                             2 * sizeof(std::int32_t)),
+    if (!Check(host(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
-        !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
-                                             sizeof(MtpCandidateLogits)),
+        !Check(host(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
                "pinned draft candidates", error_msg)) {
       return nullptr;
     }
@@ -1320,15 +1338,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
     if (rows != 0) {
       e->verification_ids_ = Alloc<std::uint32_t>(
-          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg,
+          &e->loaded_shared_.device_bytes);
       e->verification_scratch_ids_ = Alloc<std::uint32_t>(
-          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg,
+          &e->loaded_shared_.device_bytes);
       const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
-      e->verification_candidates_ =
-          Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
-      if (!Check(e->host_allocations_.Allocate(
-                     &e->verification_candidates_host_,
-                     candidates * sizeof(sampling::LogitCandidate)),
+      e->verification_candidates_ = Alloc<sampling::LogitCandidate>(
+          a, candidates, error_msg, &e->loaded_shared_.device_bytes);
+      if (!Check(host(&e->verification_candidates_host_,
+                      candidates * sizeof(sampling::LogitCandidate)),
                  "pinned verification candidates", error_msg) ||
           !Check(hip::AllocateDevice(&e->verification_penalties_,
                                      rows * kCompactPenaltyLimit *
@@ -1336,6 +1355,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                  "verification penalties", error_msg))
         return nullptr;
       e->verification_penalty_capacity_ = rows * kCompactPenaltyLimit;
+      e->loaded_shared_.device_bytes +=
+          e->verification_penalty_capacity_ * sizeof(sampling::TokenPenalty);
       e->verification_penalty_host_.reserve(e->verification_penalty_capacity_);
     }
   }
@@ -1720,48 +1741,20 @@ bool Executor::EnsureWideSegments(std::uint32_t segments,
   return true;
 }
 
+SessionMemoryBreakdown Executor::SessionMemory(
+    core::SessionMode mode, std::uint32_t max_context,
+    std::uint32_t rollback_depth) const noexcept {
+  static_assert(sizeof(__half) == sizeof(std::uint16_t));
+  return PlanSessionMemory(
+      config(), mode, max_context, options_.max_batch, options_.max_speculative,
+      max_copy_rows(), rollback_depth, sizeof(Session::Control),
+      model_->draft_output().empty() ? 0 : model_->output_row_bytes());
+}
+
 std::size_t Executor::SessionBytes(
     core::SessionMode mode, std::uint32_t max_context,
     std::uint32_t rollback_depth) const noexcept {
-  const auto& c = config();
-  const std::size_t attention = c.num_layers / c.full_attention_interval;
-  const std::size_t linear = c.num_layers - attention;
-  const std::size_t conv =
-      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t state =
-      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  const std::size_t ple =
-      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv =
-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
-  const std::size_t index =
-      std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
-          c.indexer_head_dim * sizeof(float) +
-      std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
-          sizeof(__half);
-  const auto rollback_state =
-      rollback_depth == 0
-          ? 0
-          : state + (rollback_depth - 1) *
-                        GdnRollbackRowFloats(1, c.ssm_num_k_heads,
-                                             c.ssm_num_v_heads, c.ssm_head_dim);
-  // MTP keeps every verified trunk hidden row (target_hidden: the verifier
-  // width, or a wide copy's) plus the draft block's own row (h).
-  const std::size_t hidden_rows =
-      std::size_t{std::max(options_.max_speculative, max_copy_rows())} + 1;
-  return ((linear * conv + ple) * (rollback_depth + 1) +
-          linear * (state + rollback_state)) *
-             sizeof(float) +
-         attention * (kv + index) + sizeof(Session::Control) +
-         (mode == core::SessionMode::kSpeculative
-              ? kv + index + hidden_rows * c.HcDim() * sizeof(float) +
-                    (model_->draft_output().empty()
-                         ? 0
-                         : std::size_t{speculative::kDraftVocabExtraRows} *
-                                   (model_->output_row_bytes() +
-                                    sizeof(std::int32_t)) +
-                               4096)
-              : 0);
+  return SessionMemory(mode, max_context, rollback_depth).TotalBytes();
 }
 
 std::size_t Executor::DeferredScratchBytes() const {

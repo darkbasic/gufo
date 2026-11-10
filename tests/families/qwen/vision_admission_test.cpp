@@ -33,6 +33,8 @@ std::string Refused(Function&& function) {
 }
 
 void StartupPolicies() {
+  // Historical arithmetic fixture from #920, not a host/device snapshot or
+  // evidence of physical fit. The later recorded admission is tested below.
   constexpr std::size_t available = 40088076288ULL;
   // Keep the stable image-capable graph descriptor's 64-byte allowance.
   constexpr std::size_t base = 7527108948ULL;
@@ -50,7 +52,7 @@ void StartupPolicies() {
   const auto aware = vision::PlanStartupMemory(
       available + 1024, 1024, base, worst, four_gib, four_gib, margin);
   Require(aware.Fits(4) && !aware.Fits(5),
-          "four full-context text/MTP states fit beside vision and RAM cache");
+          "historical synthetic capacity admits four text/MTP states");
   Require(aware.shared_reservation_bytes == 1024 + 2 * four_gib + margin,
           "vision, full cache grant, deferred scratch and margin are distinct");
   Require(
@@ -73,6 +75,116 @@ void StartupPolicies() {
     (void)vision::PlanStartupMemory(maximum, 0, 1, 2, 1, maximum, 1);
   });
   Require(!exact.Fits(maximum), "session aggregation cannot wrap");
+  Refused([&] { (void)exact.RequiredBytes(maximum); });
+  Refused([&] { (void)exact.DeficitBytes(maximum, maximum); });
+  const vision::StartupMemoryPlan sum_overflow{maximum, maximum - 2, 3};
+  Refused([&] { (void)sum_overflow.RequiredBytes(1); });
+}
+
+void RecordedStartupFailure() {
+  constexpr std::size_t selected = 34672033792ULL;
+  constexpr std::size_t base = 7527108948ULL;
+  constexpr std::size_t worst = 10214609236ULL;
+  constexpr std::size_t scratch = 418013184ULL;
+  constexpr std::size_t four_gib = 4294967296ULL;
+  constexpr std::size_t margin = 536870912ULL;
+
+  // The deployment logged only the selected minimum at final admission.
+  // Equal inputs reproduce that known value without inventing which limit
+  // won. The earlier vision-preparation readings are NOT this snapshot.
+  const auto memory = vision::SelectStartupCapacity(selected, selected);
+  const auto plan = vision::PlanStartupMemory(
+      memory.available_bytes, scratch, base, worst, four_gib, four_gib, margin);
+  Require(plan.state_capacity_bytes == 25127215104ULL &&
+              plan.shared_reservation_bytes == 9544818688ULL,
+          "recorded admission subtracts each distinct uncommitted allowance");
+  Require(vision::CheckedMultiply(4, base) == 30108435792ULL &&
+              plan.RequiredBytes(4) == 39653254480ULL,
+          "recorded full-context text states and total requirement are exact");
+  Require(
+      plan.Fits(3) && !plan.Fits(4) &&
+          plan.DeficitBytes(4, memory.available_bytes) == 4981220688ULL,
+      "actual deployment remains refused with its unchanged 4.639 GiB deficit");
+  Require(plan.DeficitBytes(3, memory.available_bytes) == 0,
+          "a sufficient snapshot never reports a negative deficit");
+
+  // This is an explicit hypothetical deduction, not a CLI mode change. Zero
+  // vision-memory-bytes selects conservative admission and cannot model it.
+  const auto without_vision = plan.RequiredBytes(4) - four_gib;
+  Require(
+      without_vision > selected && without_vision - selected == 686253392ULL,
+      "making the entire vision pool lazy still leaves a text-state deficit");
+  const auto conservative = vision::PlanStartupMemory(
+      selected, scratch, base, worst, 0, four_gib, margin);
+  Require(
+      conservative.per_session_bytes == worst && !conservative.Fits(4),
+      "zero retains conservative policy rather than removing vision charges");
+}
+
+void StartupCapacitySelection() {
+  // These small limits are synthetic and independent of the recorded final
+  // limiter, which was not observable in the deployment log.
+  const auto host = vision::SelectStartupCapacity(260, 240);
+  const auto device = vision::SelectStartupCapacity(240, 260);
+  const auto equal = vision::SelectStartupCapacity(240, 240);
+  Require(host.device_admission_bytes == 260 &&
+              host.host_ceiling_bytes == 240 && host.available_bytes == 240 &&
+              std::string(host.LimiterName()) == "host",
+          "production selection respects the smaller host ceiling");
+  Require(device.available_bytes == 240 &&
+              std::string(device.LimiterName()) == "device",
+          "production selection respects the smaller device budget");
+  Require(equal.available_bytes == 240 &&
+              std::string(equal.LimiterName()) == "equal",
+          "equal limits are identified without choosing an arbitrary winner");
+
+  const auto plan = [](std::size_t available, std::size_t scratch = 10,
+                       std::size_t cache = 30) {
+    return vision::PlanStartupMemory(available, scratch, 40, 60, 20, cache, 20);
+  };
+  for (const auto capacity : {host, device, equal}) {
+    const auto exact = plan(capacity.available_bytes);
+    Require(exact.state_capacity_bytes == 160 && exact.Fits(4) &&
+                !exact.Fits(5) && exact.RequiredBytes(4) == 240 &&
+                exact.DeficitBytes(4, capacity.available_bytes) == 0,
+            "exact-fit selection funds text and every uncommitted reservation");
+  }
+  for (const auto capacity : {vision::SelectStartupCapacity(260, 239),
+                              vision::SelectStartupCapacity(239, 260)}) {
+    const auto insufficient = plan(capacity.available_bytes);
+    Require(!insufficient.Fits(4) &&
+                insufficient.DeficitBytes(4, capacity.available_bytes) == 1,
+            "either limiter one byte below requirement refuses admission");
+  }
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  Require(vision::SelectStartupCapacity(maximum, 0).available_bytes == 0 &&
+              vision::SelectStartupCapacity(0, maximum).available_bytes == 0,
+          "zero capacity is not replaced by the other provider's larger limit");
+
+  // The selected free-memory snapshot already excludes loaded allocations.
+  // Committing the 30-byte cache and 10-byte scratch spends free memory, and
+  // only those now-committed allowances disappear from the remaining claim.
+  // Their bytes are never added back to the snapshot or charged twice.
+  const auto before = plan(host.available_bytes);
+  const auto committed = vision::SelectStartupCapacity(260 - 40, 240 - 40);
+  const auto after = plan(committed.available_bytes, 0, 0);
+  Require(
+      after.state_capacity_bytes == before.state_capacity_bytes &&
+          after.shared_reservation_bytes == 40 && after.Fits(4) &&
+          after.RequiredBytes(4) == 200,
+      "already-committed allocations remain consumed in both memory limits");
+  Require(before.shared_reservation_bytes == 80 &&
+              before.RequiredBytes(4) - after.RequiredBytes(4) == 40,
+          "uncommitted reservations stay charged until physical commitment");
+
+  // An unrelated allocation is also consumed in the snapshot, but cannot
+  // reduce any of this model's remaining reservations.
+  const auto less_free = vision::SelectStartupCapacity(210, 190);
+  const auto occupied = plan(less_free.available_bytes, 0, 0);
+  Require(
+      !occupied.Fits(4) &&
+          occupied.DeficitBytes(4, less_free.available_bytes) == 10,
+      "already-consumed unrelated memory cannot be credited back to admission");
 }
 
 void GeometryAndHistory() {
@@ -351,6 +463,8 @@ void PreparationLifetimes() {
 
 int main() {
   StartupPolicies();
+  RecordedStartupFailure();
+  StartupCapacitySelection();
   GeometryAndHistory();
   LifetimeAndGrowth();
   ConcurrentReservations();
