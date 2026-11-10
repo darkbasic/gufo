@@ -76,18 +76,16 @@ std::size_t RequestMemoryBytes(std::size_t prefix_rows,
 AdmissionBudget::AdmissionBudget(std::size_t capacity)
     : capacity_(capacity), ledger_({capacity, capacity, 0, 0}) {}
 
-AdmissionBudget::AdmissionBudget(std::size_t capacity,
-                                 std::size_t protected_bytes)
-    : capacity_(capacity >= protected_bytes ? capacity - protected_bytes : 0),
-      on_demand_(true),
-      protected_bytes_(protected_bytes),
-      ledger_({capacity, capacity, 0, 0}) {
-  if (protected_bytes > capacity)
-    throw core::ResourceAdmissionError(
-        "vision memory admission refused: reason=text_state_capacity");
-  if (protected_bytes)
-    protected_ = ledger_.Reserve(cache::ResourceCategory::kPrivateState,
-                                 protected_bytes);
+AdmissionBudget::AdmissionBudget(RuntimeObserver observer,
+                                 std::size_t execution_bytes)
+    : capacity_(0),
+      observer_(std::move(observer)),
+      execution_pending_(execution_bytes),
+      ledger_({std::numeric_limits<std::size_t>::max(),
+               std::numeric_limits<std::size_t>::max(), 0, 0}) {
+  if (!observer_)
+    throw std::invalid_argument(
+        "on-demand admission requires a memory observer");
 }
 
 cache::ResourceReservation AdmissionBudget::Reserve(std::size_t bytes) {
@@ -102,28 +100,87 @@ cache::ResourceReservation AdmissionBudget::Reserve(
     cache::ResourceCategory category, std::size_t bytes) {
   if (!bytes)
     return {};
+  const std::lock_guard lock(mutex_);
+  const auto pending = PendingLocked();
+  // Capture pending first. Conversion after this point can only make this
+  // attempt conservative: the old pending amount remains deducted even if
+  // the following observation also sees the newly committed allocation.
+  if (observer_) {
+    const auto available = observer_();
+    const auto capacity =
+        available > execution_pending_ ? available - execution_pending_ : 0;
+    capacity_.store(capacity);
+    if (pending > capacity || bytes > capacity - pending)
+      throw core::ResourceAdmissionError(
+          "vision memory admission refused: reason=capacity requested_bytes=" +
+          std::to_string(bytes) + " outstanding_bytes=" +
+          std::to_string(ledger_.Snapshot().total_bytes) +
+          " pending_bytes=" + std::to_string(pending) +
+          " capacity_bytes=" + std::to_string(capacity) +
+          " execution_pending_bytes=" + std::to_string(execution_pending_));
+  }
   try {
     return ledger_.Reserve(category, bytes);
   } catch (const cache::ResourceExhausted&) {
     throw core::ResourceAdmissionError(
         "vision memory admission refused: reason=capacity requested_bytes=" +
         std::to_string(bytes) +
-        " outstanding_bytes=" + std::to_string(Outstanding()) +
-        " capacity_bytes=" + std::to_string(capacity_) +
-        " protected_bytes=" + std::to_string(protected_bytes_));
+        " outstanding_bytes=" + std::to_string(ledger_.Snapshot().total_bytes) +
+        " capacity_bytes=" + std::to_string(capacity_.load()));
   }
 }
 
 std::size_t AdmissionBudget::Outstanding() const {
-  return AccountedBytes() - protected_bytes_;
-}
-
-std::size_t AdmissionBudget::AccountedBytes() const {
   return ledger_.Snapshot().total_bytes;
 }
 
+std::size_t AdmissionBudget::PendingLocked() const {
+  const auto snapshot = ledger_.Snapshot();
+  std::size_t pending = 0;
+  for (const auto bytes : snapshot.reserved_bytes)
+    pending += bytes;  // Each is a subset of the overflow-checked ledger total.
+  return pending - materialized_;
+}
+
+std::size_t AdmissionBudget::PendingBytes() const {
+  const std::lock_guard lock(mutex_);
+  return PendingLocked();
+}
+
+std::size_t AdmissionBudget::ProtectedBytes() const {
+  const std::lock_guard lock(mutex_);
+  return execution_pending_;
+}
+
+std::size_t AdmissionBudget::AccountedBytes() const {
+  const std::lock_guard lock(mutex_);
+  return CheckedAdd(execution_pending_, ledger_.Snapshot().total_bytes);
+}
+
+void AdmissionBudget::CommitExecution(std::size_t bytes) {
+  if (!OnDemand())
+    return;
+  const std::lock_guard lock(mutex_);
+  if (bytes > execution_pending_)
+    throw std::logic_error("execution commitment exceeds admitted obligations");
+  execution_pending_ -= bytes;
+}
+
+void AdmissionBudget::ReleaseExecution(std::size_t bytes) noexcept {
+  if (!OnDemand())
+    return;
+  const std::lock_guard lock(mutex_);
+  execution_pending_ += bytes;
+}
+
+void AdmissionBudget::ReplaceCommitted(std::size_t old_bytes,
+                                       std::size_t new_bytes) noexcept {
+  const std::lock_guard lock(mutex_);
+  materialized_ = materialized_ - old_bytes + new_bytes;
+}
+
 void AdmissionBudget::ClaimExecutionOwner() {
-  if (on_demand_ && execution_owner_.test_and_set(std::memory_order_acq_rel))
+  if (OnDemand() && execution_owner_.test_and_set(std::memory_order_acq_rel))
     throw core::ResourceAdmissionError(
         "vision memory admission refused: reason=execution_owner "
         "the on-demand runner already belongs to an execution pool");
@@ -147,13 +204,48 @@ void PreparationReservation::Finish() noexcept {
 }
 
 void PreparationReservation::Finish(std::size_t pixel_bytes) {
-  if (on_demand_ && pixels_)
+  if (on_demand_ && pixels_) {
     pixels_.Shrink(pixel_bytes);
+    if (pixels_)
+      committed_pixels_ = pixels_.Convert();
+  }
   Finish();
 }
 
 AdmissionLease::AdmissionLease(std::shared_ptr<AdmissionBudget> budget)
     : budget_(std::move(budget)) {}
+
+AdmissionLease::~AdmissionLease() {
+  Clear();
+}
+
+AdmissionLease::AdmissionLease(AdmissionLease&& other) noexcept
+    : budget_(std::move(other.budget_)),
+      reservations_(std::move(other.reservations_)),
+      bytes_(std::exchange(other.bytes_, 0)),
+      committed_(std::exchange(other.committed_, 0)) {}
+
+AdmissionLease& AdmissionLease::operator=(AdmissionLease&& other) noexcept {
+  if (this != &other) {
+    Clear();
+    budget_ = std::move(other.budget_);
+    reservations_ = std::move(other.reservations_);
+    bytes_ = std::exchange(other.bytes_, 0);
+    committed_ = std::exchange(other.committed_, 0);
+  }
+  return *this;
+}
+
+void AdmissionLease::SetCommitted(std::size_t bytes) noexcept {
+  if (!budget_ || !budget_->OnDemand())
+    return;
+  // A caller may leave partially allocated work pending on failure, but must
+  // never claim commitment for storage outside this owner's reservation.
+  if (bytes > bytes_)
+    std::terminate();
+  budget_->ReplaceCommitted(committed_, bytes);
+  committed_ = bytes;
+}
 
 void AdmissionLease::Grow(std::size_t bytes) {
   if (!budget_ || bytes <= bytes_)
@@ -167,6 +259,7 @@ void AdmissionLease::Grow(std::size_t bytes) {
 void AdmissionLease::Shrink(std::size_t bytes) noexcept {
   if (!budget_ || bytes >= bytes_)
     return;
+  SetCommitted(0);
   while (bytes_ > bytes) {
     auto& part = reservations_.back();
     const auto released = std::min(part.bytes, bytes_ - bytes);
@@ -180,6 +273,7 @@ void AdmissionLease::Shrink(std::size_t bytes) noexcept {
 }
 
 void AdmissionLease::Clear() noexcept {
+  SetCommitted(0);
   reservations_.clear();
   bytes_ = 0;
 }
@@ -220,11 +314,12 @@ StartupMemoryPlan PlanStartupMemory(
   if (on_demand && vision_budget)
     throw std::invalid_argument(
         "on-demand admission cannot reserve a fixed pool");
-  if (!vision_budget && !on_demand) {
+  if (!vision_budget) {
     return {available_bytes > deferred_scratch
                 ? available_bytes - deferred_scratch
                 : 0,
-            conservative_per_session, deferred_scratch};
+            on_demand ? base_per_session : conservative_per_session,
+            deferred_scratch};
   }
   const auto shared = CheckedAdd(CheckedAdd(deferred_scratch, vision_budget),
                                  CheckedAdd(cache_budget, runtime_margin));

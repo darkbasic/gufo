@@ -30,6 +30,10 @@ struct ComponentCacheHooks {
   // device headroom, registration or allocation cannot back the full plan.
   // False preserves bounded startup preparation and lazy growth.
   bool require_full_backing{false};
+  // Coordinate only actual backing growth with competing allocations. No
+  // reservation is acquired for the configured maximum or unused segments.
+  // The provider retains the converted charge until registered pages die.
+  std::function<cache::ResourceReservation(std::size_t)> reserve_segment{};
 };
 
 // HIP component-cache backing for any adapter: pinned committed pages, a

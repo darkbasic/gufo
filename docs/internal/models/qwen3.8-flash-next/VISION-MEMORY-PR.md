@@ -1,55 +1,63 @@
 # PR draft: on-demand vision memory admission
 
-Title: `fix(qwen): reserve vision execution memory on demand`
+Title: `fix(qwen): admit vision work on arrival without changing text cache policy`
 
-Addresses #920. Required label: `ext-api` for the additive
-`ResourceReservation::Shrink(size_t)` contract.
+Addresses #920. Required label: `ext-api` for the additive resource ownership
+and cache backing admission hooks; retain their permanent change records.
 
-Flash-Next's conservative admission charges each execution session for a
-context-sized image payload. Its fixed-pool opt-in instead deducts the complete
-configured image pool before any request. Add `--vision-memory-policy on-demand`
-to admit text sessions using their actual text/MTP state and stable vision
-descriptors while preserving projector availability. The default remains
-conservative; positive `--vision-memory-bytes N` retains the fixed-pool behavior,
-zero remains conservative, and ambiguous combinations are rejected.
+Flash-Next's default admission charges every execution session for a
+context-sized image payload. `--vision-memory-policy on-demand` keeps the
+projector available and uses the text/MTP estimate for ordinary traffic, then
+reserves image preparation and execution capacity on arrival. Default
+conservative admission, legacy `--vision-memory-bytes`, option validation and
+unsupported providers retain their behavior.
 
-On-demand startup protects all text, deferred scratch, cache and safety
-obligations against one host/device minimum collected after model loading and
-fingerprinting. Images and optional device snapshot copies atomically reserve
-only their additional demand from the remaining capacity. Loaded allocations
-are already consumed, and fresh free-memory observations never replenish this
-bound. Prepared history, embeddings, positional storage, encoder work and
-replacement peaks remain charged through their actual lifetimes. Successful
-completion releases transient reservations; retained or partially allocated
-storage remains covered across reuse, cancellation, failure and restoration.
+Correct the earlier on-demand implementation's stronger startup contract.
+Text eligibility uses the upstream platform-aware device/state gate and
+required deferred execution work, without requiring the full cache maximum
+and additional runtime margin beneath a host/device minimum. Restore upstream
+cache sizing, the post-slot host recheck, reduced-grant reporting, lazy backing
+and pressure checks. A configured cache maximum is not an unconditional startup
+promise; the owner's four-session/full-4-GiB deployment check remains separate.
+Restore upstream lazy MTP rollback for on-demand sessions, with its admitted
+unmaterialized bytes protected until allocation. The target memory plan defers
+615,813,120 bytes of initial commitment across four sessions; this is not a
+reduction in peak memory or MTP capability. Legacy fixed-pool behavior stays
+unchanged.
 
-Preserve the full configured RAM-cache grant with upstream lazy backing. Its
-uncommitted capacity stays protected from image work; the new policy does not
-require eager allocation of all 4 GiB. Fixed-pool backing guarantees, unsupported
-providers, conservative estimate consumers, checkpoint compatibility and
-numerical execution remain unchanged. Capacity refusals use existing resource
-errors and stream-error behavior, leaving subsequent text requests usable.
+Runtime image reservations still coordinate concurrent preparation, complete
+image history, retained pixels/embeddings/positions, encoding and replacement
+peaks, restored layouts, optional snapshots and cache backing growth. Fresh
+observations constrain pending obligations; committed storage is already in
+free-memory measurements and is not charged twice. Accepted execution work
+that has not materialized stays protected. Charges follow ownership until
+buffers and asynchronous users are released. Allocation failures and ordinary
+capacity exhaustion preserve the existing resource-error and recovery paths.
 
-The change removes the unused fixed image deduction, not physical allocations.
-At the recorded ZBook capacity of 34,672,033,792 bytes, on-demand still requires
-35,358,287,184 bytes and refuses by **686,253,392 bytes**. The original fixed-pool
-case still refuses by 4,981,220,688 bytes. The
-[audit](VISION-MEMORY-ADMISSION.md) preserves those measurements and the
-unchanged session-component bounds. Context, sessions, MTP, cache budgets,
-auxiliary services and safety reserves are not reduced. No four-session fit is
-claimed.
+The recorded same-phase observation is preserved unchanged. Its previous
+combined policy refused by **730,301,776 bytes**; the corrected Linux text gate
+passes with **9,971,190,448 bytes** of headroom. That eligibility change removes
+an acceptance condition; lazy rollback changes allocation timing. Full-claim
+host arithmetic still leaves about 3.820 GiB before the existing 4 GiB host
+reserve, and hardware may trim
+the cache or refuse backing/images. No four-session/full-cache fit is claimed.
+See the [accounting comparison](VISION-MEMORY.md) and
+[recorded evidence](VISION-MEMORY-ADMISSION.md).
 
-Validation exercises production accounting, allocation lifecycle, optional
-snapshot admission, CLI metadata and cache/scheduler contracts using synthetic
-CPU fixtures. It retains aggregate allocation coverage and the mixed-workload
-harness, adapting cache checks to lazy backing and checking occupied cache
-storage before mixed execution. See the [current VM results](VISION-MEMORY-TESTS.md#on-demand-follow-up)
-for completed commands; historical test counts are separately dated.
+CPU regressions use production admission, resource hooks and ownership with
+synthetic observations and small allocations. They distinguish startup stages,
+retain concurrency/history/replacement/failure coverage and preserve strict
+mixed-workload qualification. The harness records text eligibility, completed
+startup/readiness and cache grant/backing separately, including failed
+attempts; an engine cache trim or backing-growth limit fails the owner's
+full-budget qualification while retaining functional results. See
+[validation results](VISION-MEMORY-TESTS.md) for actual
+commands and outcomes.
 
-The real HIP release build, numerical image correctness and physical fit remain
-pending. The [owner procedure](VISION-MEMORY-VALIDATION.md) uses one full-workload
-attempt after production chat is unloaded, with required auxiliary services
-retained, a separate port and a disposable disk-backed cache. It stops on startup
-refusal and retains evidence instead of requiring another model load. No model
-download, inference-host access, deployment-launcher change, commit or push is
-part of this patch.
+The real HIP release build, GPU numerical correctness and physical workload
+fit remain pending. The [owner procedure](VISION-MEMORY-VALIDATION.md) makes one
+candidate attempt after production chat is unloaded, retaining auxiliary
+services, unchanged settings, a separate port and disposable disk-backed cache.
+It stops on startup refusal and preserves that log. The independent GGUF
+identity and disk-publication fixes remain intact; no launcher changes,
+weights, inference-host access, commits or pushes are part of this correction.

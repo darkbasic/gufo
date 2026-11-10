@@ -1,20 +1,129 @@
 # Vision admission: VM validation
 
-As of November 9, 2026, the implementation builds and passes the CPU checks
-below in a VM without an inference GPU or model weights. No weights were
+The results below distinguish the current scope correction from earlier
+iterations in a VM without an inference GPU or model weights. No weights were
 downloaded, no inference host was accessed, and no hardware qualification ran.
 The [accounting analysis](VISION-MEMORY.md) and
 [owner-run GPU procedure](VISION-MEMORY-VALIDATION.md) describe the remaining
 physical-capacity, performance and numerical checks.
 
-## On-demand follow-up
+## Corrective scope follow-up
 
-As of November 10, 2026, the on-demand implementation and harness passed the
-CPU checks below, starting from `d3e9031bee83b27e9babd75b371cbad2ff85ea94`.
+The correction starts from clean HEAD
+`0825cdd0977a5c3e8749f55c8435b628f2bf9500` and preserves the earlier fixes.
+Its tests distinguish the device text-state gate from optional cache growth
+and runtime image admission. The recorded 730,301,776-byte combined refusal
+is retained as historical evidence; the same inputs pass the narrower text
+gate with 9,971,190,448 bytes of headroom.
+
+On November 10, 2026, the focused native build and CPU tests passed using
+production accounting, resource hooks and ownership with synthetic observations.
+The same production cache-policy helpers are used by the runner and host tests;
+reduced grants and unchanged upstream lazy/pressure behavior are tested without
+compiling the HIP-guarded runner.
+
+| Corrective check | Result |
+| --- | --- |
+| Focused CPU build, ten targets below | Passed |
+| Focused native CTest regressions | 10/10 passed; 4.47 seconds |
+| Final native PR gate, including lazy rollback and cache-hook tests | 115/115 passed; 34.14 seconds |
+| Harness CPU configuration/evidence/orchestration tests | 36/36 passed; 0.003 seconds |
+| Python compilation | Passed |
+| Extension API check | Passed; 0.2.24, 130 surface paths |
+| Generated infrastructure check | Passed |
+| Documentation check | Passed; 165 Markdown files, 712 local links |
+| Targeted ASan/UBSan with leak detection | Admission 0.020 seconds; execution/snapshot accounting 0.012 seconds; DeviceInput/prompt lifecycle 0.043 seconds; all passed |
+
+The harness additions distinguish text eligibility from readiness, retain
+legitimate cache trims separately from owner qualification and preserve failed
+attempt logs. Cache-pressure checks reject owner qualification after a backing
+limit on either load, without confusing expected image refusals with cache
+pressure or erasing a limit after later successful growth.
+The focused tests cover default/fixed/on-demand policy, recorded
+and exact boundaries, pending versus committed observations, concurrent images,
+optional snapshots and backing, retained history/restoration and failure cleanup.
+The model's production execution-commitment helper also checks deferred MTP
+rollback growth, partial allocation failure, trimming and reset without letting
+optional work consume accepted but unmaterialized rows.
+
+Commands use the existing configured CPU build and local dependency paths;
+no production compiler flags or dependencies were changed:
+
+```sh
+env LD_LIBRARY_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu \
+  PYTHONPATH=/tmp/gufo-cpu-python \
+  PKG_CONFIG_SYSROOT_DIR=/tmp/gufo-cpu-deps \
+  PKG_CONFIG_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu/pkgconfig \
+  cmake --build --preset cpu-test --parallel 4 --target \
+  component_text_cache_test admission_memory_test text_model_runner_test \
+  text_generation_scheduler_test cache_full_backing_test cache_ledger_test \
+  qwen_vision_admission_test qwen_vision_lifecycle_test \
+  qwen38_flash_next_runner_options_test qwen38_flash_next_memory_test
+
+env LD_LIBRARY_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu \
+  PYTHONPATH=/tmp/gufo-cpu-python \
+  ctest --preset cpu-test --output-on-failure -R \
+  '^(component_text_cache_test|admission_memory_test|text_model_runner_test|text_generation_scheduler_test|cache_full_backing_test|cache_ledger_test|qwen_vision_admission_test|qwen_vision_lifecycle_test|qwen38_flash_next\.runner_options|qwen38_flash_next\.memory)$'
+
+env LD_LIBRARY_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu \
+  PYTHONPATH=/tmp/gufo-cpu-python \
+  PKG_CONFIG_SYSROOT_DIR=/tmp/gufo-cpu-deps \
+  PKG_CONFIG_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu/pkgconfig \
+  cmake --build --preset pr --parallel 4
+
+python3 tests/functional/test_vision_memory_admission.py
+python3 -m py_compile tests/functional/vision_memory_admission.py tests/functional/test_vision_memory_admission.py
+python3 tools/ci/check-extension-api.py
+python3 tools/ci/generate-infrastructure.py --check
+python3 tools/ci/check-docs.py
+```
+
+The initial focused logs are `/tmp/gufo-920-corrected-build.log` and
+`/tmp/gufo-920-corrected-focused-ctest.log`. The first broader PR gate exposed
+one extension-isolation failure from the new model-owned cache-policy helper;
+114 of 115 tests passed. After correcting its build ownership, the final gate
+passed 115/115; its log is `/tmp/gufo-920-corrected-pr-final.log`.
+
+The whole-tree `python3 tools/ci/check-format.py` reports only the unchanged
+baseline violations in `src/cli/serve/audio_tts_api.cpp:473` and
+`tests/cli/openai_chat_test.cpp:6633`. Those unrelated files remain untouched;
+this is not a claim that the pinned Nix formatting gate passed.
+
+All three sanitizer runs use GCC with
+`-std=c++20 -O1 -g -UNDEBUG -DGUFO_CACHE_TESTING -pthread
+-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all`,
+and `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` plus
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`. The admission and model memory
+tests compile their test source with production `admission.cpp` and `ledger.cpp`;
+the model test includes the real execution/snapshot ownership helpers.
+`/tmp/gufo-920-corrected-sanitizers.log` retains both exact compiler commands and
+the final runs after the lazy-rollback change.
+
+The lifecycle build also instruments production `device_input.cpp` and
+`prompt.cpp`, includes `tests/families/qwen/fake_hip`, and links existing CPU
+support libraries. Its full compiler/link command and result are in
+`/tmp/gufo-920-corrected-lifecycle-sanitizer.log`. None instrument the complete
+dependency tree or compile real HIP execution; there were no sanitizer or leak
+diagnostics in these three runs.
+
+The changed HIP-guarded translation units
+`src/models/qwen38_flash_next/runner.cpp`,
+`src/models/qwen38_flash_next/kernels/rocm/executor.cpp` and
+`src/models/qwen38_flash_next/kernels/rocm/batch.cpp` require a real HIP build.
+Production DeviceInput and cache-backing host logic uses simulated HIP in CPU
+tests; that does not compile their real HIP dependencies. The release build
+and all hardware execution remain pending. Historical native and sanitizer
+counts below do not validate this correction.
+
+## Prior on-demand follow-up
+
+As of November 10, 2026, the earlier on-demand implementation and harness passed
+the CPU checks below, starting from `d3e9031bee83b27e9babd75b371cbad2ff85ea94`
+and subsequently recorded in `0825cdd0977a5c3e8749f55c8435b628f2bf9500`.
 These results do not establish real HIP
 compilation, numerical correctness or the target machine's memory fit.
 
-| Current check | Result |
+| Historical check | Result |
 | --- | --- |
 | Build `qwen38_flash_next_runner_options_test` with `cpu-test` | Passed |
 | CTest `qwen38_flash_next.runner_options` | 1/1 passed; 0.00 seconds |

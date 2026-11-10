@@ -65,28 +65,63 @@ def qualification_options(command):
             "on-demand qualification cannot include --vision-memory-bytes, including zero")
 
 
-def cache_startup_evidence(text):
-    """The full retention grant is required; eager backing commitment is not."""
+def startup_stage_evidence(text, readiness_observed=False):
+    """Retain engine outcomes separately from this owner's stricter target."""
     records = [dict(field.split("=", 1) for field in line.split() if "=" in field)
                for line in text.splitlines()]
+    return {
+        "readiness_observed": readiness_observed,
+        "text_gate": [record for record in records
+                      if record.get("event") == "vision_admission"],
+        "model_startup_completed": any(record.get("event") == "load_completed"
+                                       for record in records),
+        "cache_grants": [record for record in records
+                         if record.get("event") == "vision_cache_grant"],
+        "cache_configuration": [record for record in records
+                                if record.get("event") == "configured"
+                                and "ram_cache" in record],
+        "cache_backing": [record for record in records
+                          if record.get("event") in ("backing_prepared", "backing_grown",
+                                                     "backing_limited", "ram_cache_trimmed")],
+    }
+
+
+def cache_startup_evidence(text):
+    """Qualify the owner's 4 GiB target; the engine may legitimately grant less."""
+    stages = startup_stage_evidence(text)
+    records = stages["text_gate"] + stages["cache_grants"] + stages["cache_configuration"]
     require(any(record.get("event") == "vision_admission"
                 and record.get("policy") == "on-demand"
+                and record.get("gate") == "device_state"
+                and record.get("result") == "eligible"
                 and record.get("vision_startup_bytes") == "0" for record in records),
-            "startup did not select on-demand admission without an unused vision reservation")
+            "startup did not select the on-demand device text gate without an unused vision reservation")
     grants = [record for record in records if record.get("event") == "vision_cache_grant"
               and record.get("policy") == "on-demand"]
     require(grants and all(record.get("granted_bytes") == "4294967296" for record in grants),
-            "effective RAM checkpoint cache is not 4 GiB")
+            "owner workload not qualified: effective RAM checkpoint cache is not 4 GiB")
     require(any(record.get("event") == "configured"
                 and record.get("capacity_bytes") == "4294967296"
                 and record.get("ram_cache") == "on" for record in records),
             "component cache did not retain its full configured RAM allowance")
     require(all(record.get("backing") == "lazy" for record in grants),
             "on-demand policy unexpectedly requires full eager cache backing")
-    backing = [int(record["committed_bytes"]) for record in records
+    backing = [int(record["committed_bytes"]) for record in stages["cache_backing"]
                if record.get("event") == "backing_prepared"]
     return {"granted_bytes": 4294967296, "backing": "lazy",
             "startup_committed_bytes": backing}
+
+
+def qualify_cache_growth(logs, evidence):
+    """A functional pass does not qualify backing that encountered pressure."""
+    events = [{"log": name, **record} for name, text in logs.items()
+              for record in startup_stage_evidence(text)["cache_backing"]
+              if record.get("event") in ("backing_limited", "ram_cache_trimmed")]
+    evidence["pressure_events"] = events
+    evidence["status"] = "not_qualified" if events else "passed"
+    require(not events,
+            "owner workload not qualified: RAM cache grant or backing growth was limited; "
+            "successful requests do not establish the full cache target")
 
 
 def populated_cache_evidence(responses):
@@ -359,10 +394,12 @@ def main():
 
     def verify_load(log):
         props = request(args.port, "/props")["response"]
+        text = log.read_text()
+        report.setdefault("startup_stages", {})[log.name] = startup_stage_evidence(
+            text, readiness_observed=True)
         require(props["total_slots"] == 4 and props["default_generation_settings"]["n_ctx"] == 262144,
                 "server changed session count or context")
         require(props["modalities"]["vision"], "vision projector is not available")
-        text = log.read_text()
         report.setdefault("cache_backing", {})[log.name] = cache_startup_evidence(text)
         require(re.search(r"event=load_completed[^\n]*speculative=mtp", text), "loaded mode is not MTP")
         return props
@@ -462,6 +499,10 @@ def main():
                     "disk checkpoint did not include the image-bearing prefix")
             require(restored["choices"][0]["message"] == warm["choices"][0]["message"], "RAM and disk image continuation differ")
             chat("text-after-restart", text_body("restart-recovery", 1, 32))
+        report["functional_workload"] = "passed"
+        report["cache_growth_qualification"] = {}
+        qualify_cache_growth({path.name: path.read_text() for path in (log, restarted_log)},
+                             report["cache_growth_qualification"])
         report["status"] = "passed"
         report["hardware_capacity"] = "observed for this workload; inspect recorded peak memory and timings"
     except BaseException as error:
@@ -469,6 +510,13 @@ def main():
         report["failure"] = str(error)
         raise
     finally:
+        # Startup can fail before the server context yields. Preserve that
+        # attempt's gate/cache evidence without starting a second model load.
+        stages = report.setdefault("startup_stages", {})
+        for path in (output / "server.log", output / "server-restarted.log"):
+            if path.is_file():
+                ready = stages.get(path.name, {}).get("readiness_observed", False)
+                stages[path.name] = startup_stage_evidence(path.read_text(), ready)
         write_json(output / "report.json", report)
 
 

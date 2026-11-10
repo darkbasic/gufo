@@ -209,8 +209,10 @@ public:
     }
   }
   ~SnapshotAllocator() {
-    for (const auto& spare : spares_)
+    for (auto& spare : spares_) {
+      spare.charge.BeforeRelease();
       (void)hipFree(spare.pointer);
+    }
     (void)hipStreamSynchronize(stream_);
     spares_.clear();
     (void)hipStreamDestroy(stream_);
@@ -243,8 +245,10 @@ public:
     {
       std::lock_guard lock(mutex_);
       if (spare_bytes_ != bytes) {
-        for (const auto& spare : spares_)
+        for (auto& spare : spares_) {
+          spare.charge.BeforeRelease();
           (void)hipFree(spare.pointer);
+        }
         (void)hipStreamSynchronize(stream_);
         spares_.clear();
         spare_bytes_ = bytes;
@@ -277,10 +281,10 @@ public:
     // Optional snapshot copies must respect the host partition as well.
     if (protect_host_)
       free = std::min(free, ext::HostSnapshotCeilingBytes());
-    // The on-demand epoch already protects cache/text/deferred obligations,
-    // whether or not their backing exists. Do not deduct committed portions
-    // again from a fresh free-memory reading. Retain the physical safety
-    // margin as a defensive check against pressure outside this epoch.
+    // Arrival-time admission protects outstanding execution and competing
+    // optional work. Committed allocations already lower this observation;
+    // do not deduct the full deferred/cache bounds a second time. Keep the
+    // existing physical margin as a check against external pressure.
     if (admission_.OnDemand())
       return free >= bytes && free - bytes >= kSnapshotDeviceSlackBytes;
     return free >= bytes &&
@@ -311,7 +315,7 @@ public:
 private:
   struct Block {
     void* pointer{};
-    cache::ResourceCharge charge;
+    SnapshotAdmission::Charge charge;
   };
 
   static void CheckStatus(hipError_t error, const char* operation) {
@@ -346,8 +350,7 @@ private:
       CheckStatus(ready, "snapshot allocation ready");
     }
     try {
-      return {data,
-              reservation ? reservation.Convert() : cache::ResourceCharge{}};
+      return {data, admission_.Commit(reservation, reserved)};
     } catch (...) {
       (void)hipFree(data);
       (void)hipStreamSynchronize(stream_);
@@ -364,12 +367,15 @@ private:
             }};
   }
   void Release(void* pointer, std::uint64_t bytes,
-               cache::ResourceCharge charge) {
+               SnapshotAdmission::Charge charge) {
     std::lock_guard lock(mutex_);
     if (bytes == spare_bytes_ && spares_.size() < kSpareBlocks) {
       spares_.push_back({pointer, std::move(charge)});
       return;
     }
+    // Protected execution capacity becomes outstanding before the pages are
+    // released. Optional-copy charges remain attached through synchronization.
+    charge.BeforeRelease();
     // In ROCm, hipFree recognizes pool allocations and bypasses SyncAllStreams.
     // Unlike hipFreeAsync, it also permits a peer blocking-stream capture.
     (void)hipFree(pointer);
@@ -758,6 +764,7 @@ Session::~Session() {
     std::lock_guard lock(snapshots_->mutex);
     snapshots_->failure = std::current_exception();
   }
+  execution_commitment_.Release();
   rollback_floor_ = 0;
   TrimRollback(0);
   for (auto& [key, exec] : graphs_) {
@@ -785,6 +792,7 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
 
 void Session::PrepareVision(hipStream_t stream) {
   vision_input_.PrepareRope(stream);
+  CommitAdmission();
   for (auto& attention : attention_)
     attention.rope = vision_input_.rope();
 }
@@ -827,6 +835,15 @@ bool Session::CheckCancellation(std::string* error) const {
 
 std::size_t Session::AllocatedBytes() const noexcept {
   return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
+}
+
+void Session::CommitAdmission() {
+  // Dynamic image buffers have their own lease. Only text/MTP storage and
+  // the stable descriptor materialize the preaccepted execution obligation.
+  const auto bytes =
+      allocated_bytes_ + rollback_bytes_ +
+      (vision_input_.rope() ? sizeof(qwen::vision::DeviceRope) : 0);
+  execution_commitment_.SetCommitted(bytes);
 }
 
 PrefillCheckpoint::~PrefillCheckpoint() {
@@ -969,6 +986,16 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   depth = std::max(depth, rollback_floor_);
   if (depth >= rollback_depth_)
     return;
+  const auto retained_bytes =
+      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_,
+                           depth) -
+      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_, 0);
+  const auto released_bytes = rollback_bytes_ - retained_bytes;
+  const auto committed = execution_commitment_.Bytes();
+  // Restore the lazy rollback obligation before releasing any physical row.
+  // Partial construction/destruction may have no committed owner yet.
+  execution_commitment_.SetCommitted(
+      committed > released_bytes ? committed - released_bytes : 0);
   // Keep graphs whose rows still exist. Deeper verifier graphs capture
   // discarded pointers; ordinary decode and MTP graphs do not.
   for (auto it = graphs_.begin(); it != graphs_.end();) {
@@ -991,10 +1018,7 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   }
   rollback_allocations_.resize(depth);
   rollback_depth_ = depth;
-  rollback_bytes_ =
-      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_,
-                           depth) -
-      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_, 0);
+  rollback_bytes_ = retained_bytes;
   ngram_snapshots_.resize(depth);
 }
 
@@ -1038,6 +1062,8 @@ void Session::Reset(bool reuse_mtp) {
 }
 
 Executor::~Executor() {
+  if (vision_memory_budget_)
+    vision_memory_budget_->ReleaseExecution(deferred_committed_bytes_);
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
   if (ple_pending_ || prefetch_.pending) {
@@ -1496,7 +1522,7 @@ bool Executor::CalibrateDecodeOverlap(std::string* error_msg) {
 std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                                                  std::uint32_t max_context,
                                                  std::string* error_msg) const {
-  std::unique_ptr<Session> s(new Session());
+  std::unique_ptr<Session> s(new Session(vision_memory_budget_));
   s->owner_ = this;
   s->vision_input_.SetMemoryAdmission(vision_memory_budget_);
   s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
@@ -1602,14 +1628,16 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
        !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
     return nullptr;
   }
-  // Request-aware admission promises the complete text/MTP state. Commit
-  // its rollback rows before snapshots or image work can use the remainder;
-  // they are part of SessionBytes, not the shared lazy-scratch allowance.
-  if (vision_memory_budget_ && s->mtp_enabled_) {
+  // Preserve the legacy fixed-pool commitment. On-demand keeps upstream
+  // lazy rollback: its accepted execution obligation remains outstanding
+  // until EnsureRollback materializes the rows, and returns before trimming.
+  if (vision_memory_budget_ && !vision_memory_budget_->OnDemand() &&
+      s->mtp_enabled_) {
     if (!EnsureRollback(*s, options_.max_speculative - 1, error_msg))
       return nullptr;
     s->rollback_floor_ = options_.max_speculative - 1;
   }
+  s->CommitAdmission();
   return s;
 }
 
@@ -1722,6 +1750,7 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
       session.ple_snapshots_.rows[row] = next;
     }
     session.rollback_depth_ = row + 1;
+    session.CommitAdmission();
   }
   return true;
 }
@@ -1771,6 +1800,7 @@ bool Executor::EnsureWideSegments(std::uint32_t segments,
                "wide rollback allocation", error_msg))
       return false;
     wide_allocations_.push_back(allocation);
+    CommitDeferredAdmission(floats * sizeof(float));
     WideSegment seg;
     seg.conv.resize(c.num_layers);
     seg.state.resize(c.num_layers);
@@ -1819,6 +1849,13 @@ std::size_t Executor::SessionBytes(
     core::SessionMode mode, std::uint32_t max_context,
     std::uint32_t rollback_depth) const noexcept {
   return SessionMemory(mode, max_context, rollback_depth).TotalBytes();
+}
+
+void Executor::CommitDeferredAdmission(std::size_t bytes) const {
+  if (vision_memory_budget_ && vision_memory_budget_->OnDemand()) {
+    vision_memory_budget_->CommitExecution(bytes);
+    deferred_committed_bytes_ += bytes;
+  }
 }
 
 std::size_t Executor::DeferredScratchBytes() const {

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <thread>
 
+#include "src/models/qwen38_flash_next/execution_admission.hpp"
 #include "src/models/qwen38_flash_next/snapshot_admission.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -113,9 +114,11 @@ void Refused(Action action, std::string_view message) {
 }
 
 void SnapshotAdmissionOwnership() {
-  // The protected 600 includes a 200-byte mutable-spare allowance, text,
-  // future cache backing and scratch. None of that is physically allocated.
-  auto budget = std::make_shared<vision::AdmissionBudget>(1000, 600);
+  // The accepted 600 covers text and deferred execution, including 200 for
+  // mutable-state spares. Optional future cache growth is not an obligation.
+  std::size_t free = 1000;
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([&] { return free; }, 600);
   qfn::SnapshotAdmission snapshots(budget, 200);
   auto image = budget->Reserve(250);
   auto first = snapshots.Reserve(100, true);
@@ -125,13 +128,15 @@ void SnapshotAdmissionOwnership() {
   auto third = snapshots.Reserve(100, true);
   Require(budget->Outstanding() == 350,
           "additional live mutable copies compete with images");
-  Refused([&] { (void)snapshots.Reserve(51, false); },
-          "aggregate image and private copies cannot exceed the epoch");
+  Refused(
+      [&] { (void)snapshots.Reserve(51, false); },
+      "aggregate image and private copies cannot exceed available capacity");
   auto extra = snapshots.Reserve(50, false);
   Require(budget->AccountedBytes() == 1000, "exact aggregate boundary fits");
   Refused([&] { (void)budget->Reserve(1); },
           "images cannot take an admitted private snapshot's bytes");
-  auto retained = third.Convert();
+  free -= 100;  // Synchronized physical allocation precedes conversion.
+  auto retained = snapshots.Commit(third);
   auto spare = std::move(retained);
   Require(budget->Outstanding() == 400,
           "moving a released allocation into retained spares keeps its charge");
@@ -145,6 +150,8 @@ void SnapshotAdmissionOwnership() {
   auto replacement = snapshots.Reserve(100, true);
   Require(budget->Outstanding() == 350,
           "freed protected allocation makes its existing allowance reusable");
+  reused.BeforeRelease();
+  free += 100;
   reused = {};
   Require(
       budget->Outstanding() == 250,
@@ -159,7 +166,9 @@ void SnapshotAdmissionOwnership() {
 }
 
 void SnapshotAdmissionFailuresAndModes() {
-  auto budget = std::make_shared<vision::AdmissionBudget>(100, 60);
+  std::size_t free = 100;
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([&] { return free; }, 60);
   qfn::SnapshotAdmission snapshots(budget, 20);
   for (const bool mutable_state : {false, true}) {
     try {
@@ -176,9 +185,13 @@ void SnapshotAdmissionFailuresAndModes() {
   Refused([&] { (void)snapshots.Reserve(1, false); },
           "failure and retry preserve the protected-spare bound");
   active = {};
-  auto copy = snapshots.Reserve(40, false).Convert();
+  auto pending_copy = snapshots.Reserve(40, false);
+  free -= 40;
+  auto copy = snapshots.Commit(pending_copy);
   Require(budget->Outstanding() == 40,
           "successful conversion retains capacity through asynchronous use");
+  copy.BeforeRelease();
+  free += 40;
   copy = {};
   Require(budget->Outstanding() == 0,
           "completion and release restore capacity for later requests");
@@ -193,8 +206,113 @@ void SnapshotAdmissionFailuresAndModes() {
           "conservative and fixed-pool snapshot behavior remains unchanged");
 }
 
+void LazyExecutionMaterialization() {
+  std::size_t free = 200;
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([&] { return free; }, 150);
+  qfn::ExecutionCommitment execution(budget);
+  free -= 60;
+  execution.SetCommitted(60);
+  Require(budget->ProtectedBytes() == 90,
+          "initial text storage leaves lazy rollback and scratch outstanding");
+  auto image = budget->Reserve(50);
+  Refused([&] { (void)budget->Reserve(1); },
+          "optional work cannot consume accepted but unmaterialized rollback");
+  free -= 40;
+  execution.SetCommitted(100);
+  Require(
+      budget->ProtectedBytes() == 50,
+      "successful lazy rollback is reflected once in the fresh observation");
+  Refused([&] { (void)budget->Reserve(1); },
+          "materializing rollback creates no extra optional capacity");
+  // Model partial trimming: restore its obligation before the physical free.
+  execution.SetCommitted(80);
+  Refused([&] { (void)budget->Reserve(1); },
+          "trim cannot lend a still-live row to image work");
+  free += 20;
+  Refused(
+      [&] { (void)budget->Reserve(1); },
+      "freed rollback remains available for accepted future text execution");
+  image = {};
+  // One row succeeds, a later allocation fails. Only the completed row is
+  // materialized; the remainder is still protected without a physical claim.
+  free -= 10;
+  execution.SetCommitted(90);
+  try {
+    throw std::bad_alloc();
+  } catch (const std::bad_alloc&) {
+  }
+  Require(execution.Bytes() == 90 && budget->ProtectedBytes() == 60,
+          "partial allocation failure preserves actual execution ownership");
+  execution.Release();
+  Refused([&] { (void)budget->Reserve(1); },
+          "reset restores all future execution before freeing its buffers");
+  free += 90;
+  auto later_image = budget->Reserve(50);
+  Require(budget->ProtectedBytes() == 150 && budget->Outstanding() == 50,
+          "reset and failed growth leave later requests healthy");
+  qfn::ExecutionCommitment conservative;
+  conservative.SetCommitted(1000);
+  auto fixed = std::make_shared<vision::AdmissionBudget>(1);
+  qfn::ExecutionCommitment legacy(fixed);
+  legacy.SetCommitted(1000);
+  Require(
+      conservative.Bytes() == 0 && legacy.Bytes() == 0,
+      "default and fixed-pool execution allocation semantics are unchanged");
+}
+
+void ProtectedSnapshotMaterialization() {
+  std::size_t free = 100;
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([&] { return free; }, 60);
+  qfn::SnapshotAdmission snapshots(budget, 20);
+  auto pending = snapshots.Reserve(20, true);
+  free -= 20;
+  auto spare = snapshots.Commit(pending);
+  Require(budget->ProtectedBytes() == 40 && budget->PendingBytes() == 0,
+          "committed protected spare is reflected in free memory, not "
+          "subtracted twice as unmaterialized execution");
+  auto image = budget->Reserve(40);
+  Refused([&] { (void)budget->Reserve(1); },
+          "materializing accepted execution does not create new headroom");
+  auto reused = spare;
+  spare = {};
+  Require(budget->ProtectedBytes() == 40,
+          "retained or shared spare owns its execution commitment");
+  // Restore the obligation first, then release its physical memory. Queries
+  // between these operations are conservative and cannot lend it to images.
+  reused.BeforeRelease();
+  Refused([&] { (void)budget->Reserve(1); },
+          "pending execution returns before protected physical storage frees");
+  free += 20;
+  reused = {};
+  Require(budget->ProtectedBytes() == 60,
+          "last protected owner restores its complete execution obligation");
+  image = {};
+  auto again = snapshots.Reserve(20, true);
+  free -= 20;
+  auto second = snapshots.Commit(again);
+  second.BeforeRelease();
+  free += 20;
+  second = {};
+  Require(budget->ProtectedBytes() == 60 && !budget->Outstanding(),
+          "repeated spare lifetimes neither leak nor duplicate reservations");
+
+  gufo::cache::ResourceReservation no_optional_ticket;
+  free -= 10;
+  auto checkpoint = snapshots.Commit(no_optional_ticket, 10);
+  Require(budget->ProtectedBytes() == 50,
+          "checkpoint slot zero materializes its accepted deferred allowance");
+  checkpoint.BeforeRelease();
+  free += 10;
+  checkpoint = {};
+  Require(budget->ProtectedBytes() == 60,
+          "checkpoint release restores only its own deferred allowance");
+}
+
 void ConcurrentSnapshotAdmission() {
-  auto budget = std::make_shared<vision::AdmissionBudget>(100, 80);
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([] { return 100; }, 80);
   qfn::SnapshotAdmission snapshots(budget, 0);
   std::barrier rendezvous(3);
   std::atomic<unsigned> admitted{}, refused{};
@@ -227,6 +345,8 @@ int main() {
   ModesAndGrowth();
   SnapshotAdmissionOwnership();
   SnapshotAdmissionFailuresAndModes();
+  LazyExecutionMaterialization();
+  ProtectedSnapshotMaterialization();
   ConcurrentSnapshotAdmission();
   std::cout << "Flash-Next production memory components passed\n";
 }

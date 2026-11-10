@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -45,41 +47,48 @@ struct ImageDimensions {
     std::size_t prefix_rows, std::span<const ImageDimensions> images,
     std::uint32_t output_width);
 
-/// One model-lifetime capacity observation. Fixed-pool mode reserves capacity
-/// at startup. On-demand mode protects text/cache/scratch obligations instead;
-/// images and optional device snapshot copies acquire only actual demand from
-/// the remainder. Lazy backing spends its protected allowance, never this
-/// remainder. Later free readings cannot replenish either ledger or spend
-/// committed storage twice. External pressure can still cause allocation
-/// failure.
+/// Fixed pools keep their startup capacity. On-demand reservations instead
+/// sample remaining host/device capacity at arrival. The observer preserves
+/// platform budgets and runtime reserves. Only unmaterialized obligations are
+/// deducted: committed allocations already reduced the observation. Snapshot
+/// pending counters BEFORE querying memory so concurrent commitment cannot
+/// disappear from both accounting and the free-memory observation.
 class AdmissionBudget {
 public:
+  using RuntimeObserver = std::function<std::size_t()>;
   explicit AdmissionBudget(std::size_t capacity);
-  AdmissionBudget(std::size_t capacity, std::size_t protected_bytes);
+  AdmissionBudget(RuntimeObserver observer, std::size_t execution_bytes = 0);
   [[nodiscard]] cache::ResourceReservation Reserve(std::size_t bytes);
   [[nodiscard]] cache::ResourceReservation ReserveShared(std::size_t bytes);
-  [[nodiscard]] std::size_t Capacity() const noexcept { return capacity_; }
-  [[nodiscard]] bool OnDemand() const noexcept { return on_demand_; }
-  [[nodiscard]] std::size_t ProtectedBytes() const noexcept {
-    return protected_bytes_;
+  /// Last observed capacity after execution obligations (not a startup grant).
+  [[nodiscard]] std::size_t Capacity() const noexcept {
+    return capacity_.load();
   }
+  [[nodiscard]] bool OnDemand() const noexcept { return bool(observer_); }
+  [[nodiscard]] std::size_t ProtectedBytes() const;
   [[nodiscard]] std::size_t AccountedBytes() const;
-  /// One startup epoch funds one execution/cache owner. Reusing its runner
-  /// for another pool would promise the same text/cache allowance twice.
-  /// Failed initialization requires a new runner and capacity observation.
+  [[nodiscard]] std::size_t PendingBytes() const;
   void ClaimExecutionOwner();
-  /// Additional obligations, including both retained allocations and work
-  /// admitted before allocation. They are not subtracted from a newer reading.
+  /// Materialization of already admitted text/deferred execution work. Call
+  /// only after allocation completes; restore the obligation before freeing
+  /// reusable execution storage. These operations never credit free memory.
+  void CommitExecution(std::size_t bytes);
+  void ReleaseExecution(std::size_t bytes) noexcept;
+  /// Total image/copy/cache ownership, including committed allocations.
   [[nodiscard]] std::size_t Outstanding() const;
 
 private:
+  friend class AdmissionLease;
+  void ReplaceCommitted(std::size_t old_bytes, std::size_t new_bytes) noexcept;
+  [[nodiscard]] std::size_t PendingLocked() const;
   [[nodiscard]] cache::ResourceReservation Reserve(
       cache::ResourceCategory category, std::size_t bytes);
-  const std::size_t capacity_;
-  const bool on_demand_{false};
-  const std::size_t protected_bytes_{0};
+  mutable std::mutex mutex_;
+  std::atomic<std::size_t> capacity_;
+  RuntimeObserver observer_;
+  std::size_t execution_pending_{0};
+  std::size_t materialized_{0};
   cache::ResourceLedger ledger_;
-  cache::ResourceReservation protected_;
   std::atomic_flag execution_owner_{};
 };
 
@@ -108,6 +117,7 @@ public:
 private:
   cache::ResourceReservation scratch_;
   cache::ResourceReservation pixels_;
+  cache::ResourceCharge committed_pixels_;
   bool on_demand_{false};
 };
 
@@ -121,14 +131,18 @@ class AdmissionLease {
 public:
   AdmissionLease() = default;
   explicit AdmissionLease(std::shared_ptr<AdmissionBudget> budget);
-  AdmissionLease(AdmissionLease&&) noexcept = default;
-  AdmissionLease& operator=(AdmissionLease&&) noexcept = default;
+  ~AdmissionLease();
+  AdmissionLease(AdmissionLease&&) noexcept;
+  AdmissionLease& operator=(AdmissionLease&&) noexcept;
   AdmissionLease(const AdmissionLease&) = delete;
   AdmissionLease& operator=(const AdmissionLease&) = delete;
   void Grow(std::size_t bytes);
   /// Call after transient allocations/work end; retained and future required
   /// buffers must remain covered. Never allocates and cannot grow the claim.
   void Shrink(std::size_t bytes) noexcept;
+  /// Actual retained bytes after synchronous allocation/work completion.
+  /// Clear this marker before releasing/replacing covered physical storage.
+  void SetCommitted(std::size_t bytes) noexcept;
   void Clear() noexcept;
   [[nodiscard]] std::size_t Bytes() const noexcept { return bytes_; }
 
@@ -140,6 +154,7 @@ private:
   };
   std::vector<Part> reservations_;
   std::size_t bytes_{0};
+  std::size_t committed_{0};
 };
 
 struct StartupCapacity {
@@ -165,15 +180,11 @@ struct StartupMemoryPlan {
                                          std::size_t available) const;
 };
 
-/// Preserve legacy admission when vision_budget is zero and on_demand is false.
-/// On-demand startup has no image deduction and preserves lazy cache backing.
-/// Fixed-pool mode reserves vision_budget as before. Both opt-in modes
-/// subtract every UNCOMMITTED shared allowance once, then test text/MTP
-/// state per session. The cache grant is reserved in full, never trimmed here.
-/// Already committed allocations lower the capacity snapshot instead. For
-/// example startup DeferredScratchBytes omits existing logits/checkpoint/wide
-/// buffers. Its snapshot-spare bound is deliberately retained even at runtime;
-/// this planner does not reinterpret that owner's safety policy.
+/// Conservative and on-demand use the existing device/state gate: subtract
+/// deferred execution work, then test the appropriate per-session estimate.
+/// Neither promises a cache maximum at startup. The fixed-pool policy retains
+/// its stronger combined plan; its caller supplies min(host, device) capacity.
+/// On-demand callers supply the platform-aware device admission capacity.
 [[nodiscard]] StartupMemoryPlan PlanStartupMemory(
     std::size_t available_bytes, std::size_t deferred_scratch,
     std::size_t base_per_session, std::size_t conservative_per_session,

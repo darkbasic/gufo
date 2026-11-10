@@ -1,122 +1,131 @@
 # Vision memory accounting
 
 `--vision-memory-policy on-demand` admits Flash-Next text sessions without an
-unused image-execution allowance. Actual image work reserves its additional
-memory before allocating. Conservative admission remains the default, and
-positive `--vision-memory-bytes N` retains its existing fixed-pool guarantee.
-This is the implementation account for #920; see the
+allowance for hypothetical images. Image work acquires its additional capacity
+before allocation. Conservative admission remains the default; positive
+`--vision-memory-bytes N` preserves the legacy fixed-pool policy. See the
 [model page](../../../models/qwen3.8-flash-next.md) for usage and the
 [owner procedure](VISION-MEMORY-VALIDATION.md) for pending GPU qualification.
 
-## Startup and the recorded constraint
+## Startup and cache contracts
 
 `Model::SessionBytes()` adds
-`context * (hidden_size * sizeof(float) + 3 * sizeof(int32_t)) + 64` with a
-projector. At 262,144 tokens and width 2560, that is 2,687,500,352 bytes per
-session, although text execution needs only the stable descriptor. Conservative
-admission retains this estimate and its existing consumers. Both opt-in modes
-use `TextSessionBytes()` for serving and MTP copy-width selection, preserving
-the text/MTP allocations and the 64-byte descriptor.
+`context * (hidden_size * sizeof(float) + 3 * sizeof(int32_t)) + 64` when a
+projector is loaded. At 262,144 tokens and width 2560, that is 2,687,500,352 bytes
+per session. Text execution needs the stable descriptor but no context-sized
+image payload. Conservative admission and other estimate consumers remain
+unchanged. The opt-in serving paths use `TextSessionBytes()`, preserving all
+text/MTP state and the 64-byte descriptor.
 
-On-demand startup protects the complete text/MTP claims, deferred scratch,
-configured RAM-cache allowance and existing 512 MiB runtime margin. It adds no
-image-pool deduction. Loaded target, MTP and projector weights and shared
-executor allocations are already consumed in the collected capacity and are
-never added back. The remaining capacity is the minimum of the device admission
-budget and the host ceiling, including the existing host/CMA/cgroup calculation
-and separate 4 GiB OS reserve. One post-fingerprinting collection feeds MTP
-copy-width selection, admission and the structured diagnostic.
+| Stage | Upstream 0.33.0 (`77dff828`) | Previous on-demand (`0825cdd`) | Corrected on-demand |
+| --- | --- | --- | --- |
+| Text gate | Device admission minus deferred execution work; conservative per-session image term | Text, full configured cache, deferred work and runtime margin must fit host/device minimum | Upstream device gate with text/MTP estimate; no hypothetical image term |
+| RAM-cache sizing | Host budget and post-slot recheck; reduced grant reported | Complete configured maximum required and protected at startup | Upstream sizing/recheck/trim reporting |
+| Per-session MTP rollback | Lazy allocation within admitted state bound | Forced complete allocation before readiness | Upstream lazy allocation; pending execution allowance retained |
+| Backing | Bounded warmup, lazy growth, host/device pressure checks | Lazy backing within a permanently protected maximum | Upstream lazy backing with shared arrival-time coordination |
+| Image capacity | Conservative startup allowance | Fixed remainder of the combined startup epoch | Current capacity and outstanding obligations checked before image work |
 
-The [November 10, 2026 fixed-pool observation](VISION-MEMORY-ADMISSION.md)
-selected 34,672,033,792 bytes. Removing its unused 4,294,967,296-byte vision
-deduction changes the remaining requirement from 39,653,254,480 to
-35,358,287,184 bytes. **The recorded on-demand configuration still refuses by
-686,253,392 bytes.** The fixed-pool regression still refuses by 4,981,220,688
-bytes. No redundant model allocation was identified, and this change does not
-claim a physical saving or four-session fit. Lazy cache backing changes when
-memory is allocated, not its protected allowance or peak requirement.
+The text gate uses `QueryAdmissionMemory()` and deducts deferred execution work
+once. Its existing platform rules remain: Linux may use HIP free bytes, while
+Windows also applies its device/host admission constraints. The diagnostic's
+host ceiling is not an additional text acceptance condition. Actual text-state
+insufficiency and later allocation failures still fail startup.
 
-## Ownership and admission
+`ResourceClaim()` again reports the ordinary host snapshot budget and ceiling.
+The serving cache rechecks them after slots allocate, preserves its metadata
+and staging accounting, and reports any reduced grant. On-demand does not
+require an exact full cache grant or full backing commitment. Optional future
+cache growth is not reserved at text startup; each growth segment must pass
+upstream pressure checks and acquire runtime capacity before committing pages.
+Conservative and legacy fixed-pool hooks retain their previous behavior.
 
-| Storage | Owner and lifetime | On-demand accounting |
-| --- | --- | --- |
-| Target, shared Q8 MTP and BF16 projector weights; loaded shared executor buffers | Loaded model | Already reflected in the startup capacity |
-| KV/index rows, recurrent/PLE state, MTP hidden/draft/rollback rows, stable vision descriptor | Execution session | Complete protected text claim; rollback is materialized before readiness |
-| Deferred wide rollback, batch logits, checkpoint arena and bounded mutable-state spares | Shared executor | Existing deferred allowance protected once |
-| RAM checkpoint backing and disk transfer staging | Component cache | Full configured cache grant protected; upstream lazy backing and bounded staging retained |
-| Prepared RGB image history | Prepared request and attached session | Preparation bound acquired before decode/resize, reduced to actual retained RGB capacity afterward |
-| Image embeddings and GPU/host positional arrays | DeviceInput and its attached history | Full relevant history, retained capacity and replacement peak reserved before allocation |
-| Encoder arrays and pinned upload | One serialized encoding operation | Largest sequential image working set, released only after work and transient storage end |
-| Optional device snapshot copies beyond protected spares | Snapshot allocator | Compete atomically with image work for the remaining capacity; retained spare blocks keep tickets |
+On-demand also restores upstream lazy MTP rollback allocation. The measured
+target's production memory plan assigns 153,953,280 bytes per session to those
+rows, or 615,813,120 bytes across four sessions. Deferring their initial
+allocation changes startup commitment, not the peak claim or MTP capability.
+The runtime coordinator keeps the unmaterialized rows pending; each successful
+row allocation replaces that pending amount with committed ownership. Trimming
+rows restores their pending obligation before freeing them. The fixed-pool
+mode retains its earlier eager rollback and retained floor.
 
-The cache keeps its complete 4 GiB retention grant. On-demand mode does not set
-`ComponentCacheHooks::require_full_backing`: upstream warmup requests up to
-2 GiB of backing, then grows within the grant. Uncommitted cache capacity is
-never lent to images. Fixed-pool mode retains its existing full-backing
-requirement; unsupported providers keep their prior behavior.
+The [same-phase ZBook observation](VISION-MEMORY-ADMISSION.md#on-demand-observation-at-0825cdd)
+was refused by the previous combined policy with a 730,301,776-byte deficit.
+The corrected device text gate has 9,971,190,448 bytes of headroom using the
+same inputs. This is eligibility, not completed startup or physical savings.
+Full-claim host arithmetic leaves about 3.820 GiB before the existing 4 GiB host
+reserve, even before an additional 512 MiB margin. Four sessions with a full
+4 GiB effective cache remain the owner's separate hardware target; a trimmed
+grant does not qualify it.
 
-## One aggregate capacity bound
+## Arrival-time accounting
 
-`AdmissionBudget` uses the existing concurrency-safe `cache::ResourceLedger`.
-On-demand mode records the model's initial remaining capacity and protects all
-text/cache/scratch/margin obligations in that ledger for the model lifetime.
-Images and optional device copies acquire tickets from the remainder. The
-bounded mutable-state spare subledger assigns storage within the already
-protected scratch allowance; it does not deduct that allowance twice.
-An epoch funds one execution/cache pool and at most its configured session
-count. Reusing the same on-demand runner for another pool is refused; failed
-initialization requires a new runner and capacity observation.
+The shared `AdmissionBudget` coordinates image work, optional device snapshot
+copies and cache backing growth through the existing resource ledger. Before
+accepting new work it samples the platform-aware device admission budget and
+host ceiling, taking their minimum and retaining the existing 512 MiB runtime
+image margin. On the APU these observations constrain the same physical memory;
+they are not two independently spendable pools.
 
-The initial bound never grows after a fresh free-memory reading. Committing
-protected session/cache buffers consumes their allowance rather than creating
-new image capacity. Runtime host/device observations can refuse allocation
-under external pressure, but cannot replenish the ledger. On an APU the host
-and device limits constrain the same capacity; they are not independent pools.
-The configured cache allowance, concurrent image tickets and snapshot tickets
-therefore cannot independently promise the same bytes.
+Reservations are serialized. Pending obligations are captured before the
+memory observation so concurrent conversion to committed ownership can only
+make the check conservative. Already committed allocations are reflected in
+free memory; they remain attached to their owners but are not subtracted again
+or credited back as newly free capacity. Accepted text/deferred execution work
+that has not materialized remains unavailable to images and optional growth.
+Neither the configured cache maximum nor a combined text/cache/margin sum is
+an on-demand startup acceptance condition.
 
-The existing 128 MiB CPU preprocessing cache can retain shared pixels after
-their prepared owner releases its ticket. Its bound remains inside the
-unchanged 512 MiB runtime margin, alongside bounded staging/metadata and opaque
-driver/library overhead; that margin is not lent to images.
+| Storage | Owner and accounting |
+| --- | --- |
+| Target, shared Q8 MTP and BF16 projector weights; loaded shared executor buffers | Already consumed in the observed available memory |
+| KV/index rows, recurrent/PLE state, MTP hidden/draft/rollback rows, stable vision descriptor | Text session; accepted unmaterialized execution obligations remain protected |
+| Deferred batch logits, wide-copy rollback, checkpoint arena and bounded mutable-state spares | Shared executor; pending allowance diminishes only after actual commitment |
+| RAM checkpoint backing | Component cache; each segment reserves before allocation/registration and retains its charge until freed |
+| Prepared RGB image history | Prepared request/image pointers; preparation bound acquired before decode/resize, then reduced to retained RGB capacity |
+| Image embeddings and GPU/host positional arrays | DeviceInput and attached history; retained capacity and replacement peak reserved before allocation |
+| Encoder arrays and pinned upload | Encoding operation; largest sequential working set released only after asynchronous users and storage end |
+| Optional device snapshot copies | Snapshot allocator; shared capacity, with retained spare blocks keeping ownership charges |
 
-Preparation first reserves the bounded 1 GiB decode/resize workspace and up to
-48 MiB RGB capacity per image. Completion releases transient work and shrinks
-the on-demand pixel ticket to the actual retained vector capacity. DeviceInput
-includes all historical embeddings, both positional arrays, encoder workspace
-and buffers that coexist during replacement. Stable descriptors belong to the
-text base. Reused layouts and RAM/disk restoration enter the same path.
-Checkpoints retain image identity/layout; missing embeddings are recreated
-under the current attached history's reservation.
-Prepared image pointers retain their pixel ticket directly, so copying or
-assigning a prompt, or retaining an individual image, cannot release it early.
+Upstream cache reserve checks still run; internal reservations do not exempt
+backing growth from external pressure. A cache grant is its retention limit,
+not a promise to allocate every byte. Backing refusal keeps its warning and
+normal cache fallback. The existing 128 MiB CPU preprocessing cache stays
+inside the unchanged runtime margin alongside bounded staging/metadata and
+opaque driver/library overhead.
 
-On-demand leases shrink only after encoding/upload work and transient storage
-finish, retaining the charge for every live buffer. Failed allocation or copy
-can leave partial storage, so failure keeps its admitted bound. Text transition,
-reset and destruction synchronize users and free storage before releasing its
-ticket. Cancellation and a shorter restored layout do not imply that retained
-capacity has disappeared. Fixed-pool leases retain their earlier high-water
-behavior for compatibility.
+## Ownership and refusals
 
-## Refusals, compatibility and limits
+Preparation reserves the bounded 1 GiB decode/resize workspace and up to
+48 MiB RGB capacity per image before preparing or counting tokens, including
+entry points that run before execution-slot acquisition. Completion releases
+transient work and shrinks the pixel ticket to actual retained vector capacity.
+Pixel pointers retain the ticket through prompt copies, assignments and
+individual image retention.
 
-Insufficient capacity produces the existing `resource_exhausted` response;
-preparation and immediate slot refusals return HTTP 503 before streaming.
-Already-open queued streams use the scheduler's terminal error path. Ordinary
-capacity refusal does not mark the GPU unhealthy or prevent later text work.
-No indefinite wait is introduced. Diagnostics report policy, limits, protected
-and outstanding claims, cache grants and refusal reason without request content.
+DeviceInput accounts for all relevant history, embeddings, both positional
+arrays, encoder workspace and old/new buffers coexisting during replacement.
+Stable descriptors belong to the text base. Reused layouts and RAM/disk
+restoration use the same admission path. Checkpoints retain image identity and
+layout; missing embeddings are recreated under the attached history's claim.
 
-The initial bound is a logical guarantee between Gufo owners, not physical
-preallocation or protection against another process consuming memory. Existing
-allocation-failure cleanup remains necessary. Memory released by unrelated
-processes after startup does not enlarge image capacity; a later request may
-therefore refuse despite a larger current free reading. Even small images can
-refuse when the remaining bound is too small for preparation or retained peers.
+Leases shrink only after work and transient storage end. Partial allocation
+failure retains coverage for surviving buffers and remaining work. Reset,
+text transitions and destruction synchronize users and free storage before
+releasing charges. Cancellation or a shorter restored layout cannot release
+retained capacity. Fixed-pool leases keep their prior high-water behavior.
 
-`ResourceReservation::Shrink(size_t)` is additive and requires the `ext-api`
-label and its permanent change record. Numerical operators, image positions,
-checkpoint payloads and compatibility identities are unchanged. This admission
-behavior does not establish the owner's four-session physical-memory fit,
-numerical image correctness or performance; those require the actual GPU.
+Insufficient image capacity uses the existing structured `resource_exhausted`
+response and normal `usage.gufo` reporting where applicable. Preparation and
+immediate slot refusals return HTTP 503 before streaming; an already-open
+queued stream uses the scheduler's terminal error path. Ordinary exhaustion
+does not mark the GPU unhealthy or fabricate success; later text requests can
+continue. No indefinite wait or per-token memory polling is introduced.
+
+Internal coordination cannot prevent another process consuming memory after
+an observation. Allocation-failure cleanup remains necessary, and the bounds
+are not exhaustive measurements of opaque driver/BLAS storage. Diagnostics
+separate text eligibility, effective cache grant/backing, current runtime
+capacity, pending/committed ownership and refusal reasons without content or
+credentials. Numerical operators, image positions and checkpoint identities
+are unchanged. CPU tests establish these accounting contracts, not GPU
+compilation, four-session physical fit, numerical quality or performance.

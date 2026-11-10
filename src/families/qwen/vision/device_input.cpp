@@ -20,6 +20,7 @@ void Check(hipError_t error) {
 }  // namespace
 
 DeviceInput::~DeviceInput() {
+  admission_.SetCommitted(0);
   if (descriptor_ != nullptr)
     (void)hipFree(descriptor_);
   if (positions_ != nullptr)
@@ -91,8 +92,10 @@ void DeviceInput::ReserveRequest(const Prompt* prompt, const Encoder* encoder,
           " claim_bytes=" + std::to_string(admission_.Bytes()) +
           " committed_device_bytes=" +
           std::to_string(Bytes() - (descriptor_ ? sizeof(DeviceRope) : 0)) +
-          " protected_epoch_bytes=" +
+          " execution_pending_bytes=" +
           std::to_string(admission_budget_->ProtectedBytes()) +
+          " pending_bytes=" +
+          std::to_string(admission_budget_->PendingBytes()) +
           " request_bytes=" + std::to_string(required) + " retained_bytes=" +
           std::to_string(retained) + " outstanding_bytes=" +
           std::to_string(admission_budget_->Outstanding()) +
@@ -148,12 +151,19 @@ void DeviceInput::SettleRequest() {
   // Missing embeddings remain an obligation, including restored history.
   admission_.Shrink(
       OnDemandBytes(prompt_.get(), encoder_.get(), capacity_, true, false));
+  auto committed = Bytes() - (descriptor_ ? sizeof(DeviceRope) : 0);
+  if (prompt_ && prompt_->memory_admission.lock() != admission_budget_)
+    for (const auto& image : prompt_->images)
+      if (image.pixels)
+        committed = CheckedAdd(committed, image.pixels->pixels.capacity());
+  admission_.SetCommitted(committed);
 }
 
 void DeviceInput::ReleaseImageStorage(hipStream_t stream) {
   // The stable descriptor has already been rewritten to an empty layout.
   // Drain users before dropping embeddings, then positions, then the claim.
   Check(hipStreamSynchronize(stream));
+  admission_.SetCommitted(0);
   embeddings_.clear();
   if (positions_ != nullptr)
     Check(hipFree(positions_));
@@ -203,6 +213,7 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
                            (descriptor_ == nullptr && !incoming.images.empty());
   ReserveRequest(prompt.get(), encoder.get(), incoming.PrefixLength(), !reuse,
                  reuse, layout_work);
+  admission_.SetCommitted(0);
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
   if (!reuse)
@@ -226,6 +237,7 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
     ReserveRequest(prompt_.get(), encoder_.get(), layout.PrefixLength(), true,
                    true, true);
   }
+  admission_.SetCommitted(0);
   ApplyLayout(layout, stream);
   SettleRequest();
 }

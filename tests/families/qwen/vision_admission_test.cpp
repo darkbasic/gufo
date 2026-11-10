@@ -113,13 +113,7 @@ void RecordedStartupFailure() {
   const auto without_vision = plan.RequiredBytes(4) - four_gib;
   Require(
       without_vision > selected && without_vision - selected == 686253392ULL,
-      "making the entire vision pool lazy still leaves a text-state deficit");
-  const auto on_demand = vision::PlanStartupMemory(
-      selected, scratch, base, worst, 0, four_gib, margin, true);
-  Require(!on_demand.Fits(4) && on_demand.RequiredBytes(4) == 35358287184ULL &&
-              on_demand.DeficitBytes(4, selected) == 686253392ULL,
-          "actual on-demand policy removes only unused vision, not real "
-          "obligations");
+      "historical combined host policy still has a deficit without its pool");
   const auto conservative = vision::PlanStartupMemory(
       selected, scratch, base, worst, 0, four_gib, margin);
   Require(
@@ -127,79 +121,164 @@ void RecordedStartupFailure() {
       "zero retains conservative policy rather than removing vision charges");
 }
 
+void RecordedOnDemandCorrection() {
+  // Same-phase fresh-boot observation. Keep every measured input unchanged.
+  constexpr std::size_t device = 40497639424ULL;
+  constexpr std::size_t host_available = 38922952704ULL;
+  constexpr std::size_t host_reserve = 4294967296ULL;
+  constexpr std::size_t host_ceiling = 34627985408ULL;
+  constexpr std::size_t base = 7527108948ULL;
+  constexpr std::size_t worst = 10214609236ULL;
+  constexpr std::size_t scratch = 418013184ULL;
+  constexpr std::size_t cache = 4294967296ULL;
+  constexpr std::size_t margin = 536870912ULL;
+  const auto memory = vision::SelectStartupCapacity(device, host_ceiling);
+  Require(host_available - host_reserve == host_ceiling &&
+              std::string(memory.LimiterName()) == "host",
+          "recorded host/device breakdown remains unchanged");
+  // Historical broader plan: diagnostic evidence, not the corrected gate.
+  const vision::StartupMemoryPlan previous{
+      memory.available_bytes - scratch - cache - margin, base,
+      scratch + cache + margin};
+  Require(previous.state_capacity_bytes == 29378134016ULL &&
+              previous.RequiredBytes(4) == 35358287184ULL &&
+              previous.DeficitBytes(4, memory.available_bytes) == 730301776ULL,
+          "preserve historical on-demand combined refusal exactly");
+  const auto corrected =
+      vision::PlanStartupMemory(memory.device_admission_bytes, scratch, base,
+                                worst, 0, cache, margin, true);
+  Require(corrected.Fits(4) &&
+              corrected.state_capacity_bytes - 4 * base == 9971190448ULL &&
+              corrected.RequiredBytes(4) == 4 * base + scratch,
+          "platform device gate admits recorded text without a cache promise");
+  Require(host_available - 4 * base - cache - scratch == 4101536432ULL &&
+              4101536432ULL < host_reserve,
+          "passing the text gate cannot qualify the full host/cache target");
+  const auto exact = vision::PlanStartupMemory(
+      4 * base + scratch, scratch, base, worst, 0, cache, margin, true);
+  const auto shortfall = vision::PlanStartupMemory(
+      4 * base + scratch - 1, scratch, base, worst, 0, cache, margin, true);
+  Require(exact.Fits(4) && !shortfall.Fits(4),
+          "genuine text-state insufficiency remains a failure");
+}
+
 void OnDemandObligations() {
-  // Both alternatives reject this honest observation; on-demand admits text
-  // with no image reservation while protecting the same full cache/scratch.
   const auto legacy = vision::PlanStartupMemory(350, 10, 40, 100, 0, 30, 20);
   const auto fixed = vision::PlanStartupMemory(350, 10, 40, 100, 140, 30, 20);
   const auto demand =
       vision::PlanStartupMemory(350, 10, 40, 100, 0, 30, 20, true);
   Require(!legacy.Fits(4) && !fixed.Fits(4) && demand.Fits(4),
-          "text eligibility does not require any hypothetical image capacity");
+          "text eligibility does not require hypothetical images");
   Require(
-      demand.shared_reservation_bytes == 60 && demand.RequiredBytes(4) == 220,
-      "on-demand preserves full cache, scratch and safety obligations");
-  const auto exact =
-      vision::PlanStartupMemory(220, 10, 40, 100, 0, 30, 20, true);
+      demand.shared_reservation_bytes == 10 && demand.RequiredBytes(4) == 170,
+      "cache maximum and image runtime margin are not text prerequisites");
   Require(
-      exact.Fits(4) &&
-          !vision::PlanStartupMemory(219, 10, 40, 100, 0, 30, 20, true).Fits(4),
-      "exact text fit requires no minimum image headroom");
-  auto no_images = std::make_shared<vision::AdmissionBudget>(220, 220);
-  Require(no_images->Outstanding() == 0 && no_images->Capacity() == 0,
-          "zero spare capacity is healthy text-only startup, not conservative "
-          "mode");
-  Refused([&] { (void)no_images->Reserve(1); });
-  Refused([&] { (void)vision::AdmissionBudget(219, 220); });
+      vision::PlanStartupMemory(170, 10, 40, 100, 0, 30, 20, true).Fits(4) &&
+          !vision::PlanStartupMemory(169, 10, 40, 100, 0, 30, 20, true).Fits(4),
+      "exact device/state boundary is independent of future cache growth");
   Refused<std::invalid_argument>([&] {
     (void)vision::PlanStartupMemory(350, 10, 40, 100, 1, 30, 20, true);
   });
-  Refused(
-      [&] { (void)vision::PlanStartupMemory(10, 1, 1, 2, 0, 10, 0, true); });
   const auto maximum = std::numeric_limits<std::size_t>::max();
-  Refused([&] {
-    (void)vision::PlanStartupMemory(maximum, 1, 1, 2, 0, maximum, 0, true);
-  });
-
+  Require(
+      vision::PlanStartupMemory(10, 1, 1, 2, 0, maximum, maximum, true).Fits(4),
+      "unused optional cache bounds cannot overflow or refuse text startup");
+  std::size_t free =
+      160;  // Host/image budget can be below accepted device work.
   auto budget =
-      std::make_shared<vision::AdmissionBudget>(350, demand.RequiredBytes(4));
-  Require(budget->OnDemand() && budget->Capacity() == 130 &&
-              budget->ProtectedBytes() == 220 &&
-              budget->AccountedBytes() == 220 && budget->Outstanding() == 0,
-          "epoch starts with funded non-vision obligations and no image usage");
+      std::make_shared<vision::AdmissionBudget>([&] { return free; }, 170);
+  Require(budget->OnDemand() && budget->Outstanding() == 0 &&
+              budget->ProtectedBytes() == 170,
+          "constructing runtime coordination does not repeat the host gate");
+  Refused([&] { (void)budget->Reserve(1); });
   budget->ClaimExecutionOwner();
   Refused([&] { budget->ClaimExecutionOwner(); });
-  Require(budget->Outstanding() == 0,
-          "a second execution/cache pool cannot spend this epoch again");
+  // More headroom arrives. No free-memory query can erase pending claims.
+  free = 300;
   auto image = budget->Reserve(100);
   auto copy = budget->ReserveShared(30);
   Refused([&] { (void)budget->Reserve(1); });
   Refused([&] { (void)budget->ReserveShared(1); });
-  Require(
-      budget->AccountedBytes() == 350,
-      "image and optional checkpoint copies cannot spend the same remainder");
-  // Physical commitment of pre-funded cache/scratch does not change the
-  // accounting epoch or lend its still-unused allowance to another request.
-  std::vector<std::uint8_t> cache_backing(15), scratch(10);
-  Require(cache_backing.size() + scratch.size() == 25 &&
-              budget->AccountedBytes() == 350,
-          "partly committed cache and scratch stay inside protected allowance");
-  cache_backing.resize(30);
-  Require(budget->Outstanding() == 130 && budget->Capacity() == 130,
-          "full lazy cache growth neither subtracts twice nor replenishes "
-          "capacity");
+  Require(budget->PendingBytes() == 130 && budget->AccountedBytes() == 300,
+          "images and optional copies share pending admission atomically");
+  // Actual execution allocations lower free memory; remove only their pending
+  // obligation. They are never credited back to the observation.
+  free -= 160;
+  budget->CommitExecution(160);
+  Refused([&] { (void)budget->Reserve(1); });
+  Require(budget->ProtectedBytes() == 10 && budget->Capacity() == 130,
+          "committed execution is neither charged twice nor added to free");
+  // Optional cache growth has no permanent maximum reservation; its arriving
+  // segment competes with images and snapshot copies.
   copy = {};
+  auto segment = budget->ReserveShared(30);
+  free -= 30;
+  auto committed = segment.Convert();
+  Require(budget->PendingBytes() == 100,
+          "registered cache pages are reflected only in fresh observations");
+  Refused([&] { (void)budget->Reserve(1); });
   image = {};
-  Require(budget->Outstanding() == 0 && budget->ProtectedBytes() == 220,
-          "failed image admission cannot consume text or cache obligations");
-  auto subsequent = budget->Reserve(130);
-  subsequent.Shrink(0);
-  Require(!subsequent && budget->Outstanding() == 0,
-          "healthy subsequent work can reuse genuinely released storage");
+  auto next = budget->Reserve(100);
+  next = {};
+  committed = {};  // Physical pages released first in the real owner.
+  free += 30;
+  auto recovered = budget->Reserve(130);
+  recovered = {};
+  // Free memory can also fall due to another process. No stale initial cap.
+  free = 10;
+  Refused([&] { (void)budget->Reserve(1); });
+  Require(!budget->Outstanding(),
+          "refusal cannot leak reservations or harm text");
+  Refused<std::logic_error>([&] { budget->CommitExecution(11); });
+}
+
+void ObservationOrdering() {
+  // Simulate allocation/conversion between the pending sample and observer:
+  // old pending must remain deducted, even if the observation is early.
+  gufo::cache::ResourceReservation image;
+  gufo::cache::ResourceCharge pixels;
+  bool commit_during_observation = false;
+  std::size_t free = 100;
+  auto budget = std::make_shared<vision::AdmissionBudget>([&] {
+    const auto observed = free;
+    if (commit_during_observation) {
+      commit_during_observation = false;
+      free -= 60;
+      pixels = image.Convert();
+    }
+    return observed;
+  });
+  image = budget->Reserve(60);
+  commit_during_observation = true;
+  Refused([&] { (void)budget->ReserveShared(41); });
+  Require(budget->PendingBytes() == 0 && budget->Outstanding() == 60,
+          "commitment during observation cannot hide an accepted allocation");
+  auto exact = budget->ReserveShared(40);
+  Refused([&] { (void)budget->Reserve(1); });
+  exact = {};
+  pixels = {};
+  free += 60;
+  vision::AdmissionLease retained(budget);
+  retained.Grow(80);
+  free -= 50;
+  retained.SetCommitted(50);
+  Require(budget->PendingBytes() == 30,
+          "only remaining image work stays pending");
+  auto peer = budget->Reserve(20);
+  Refused([&] { (void)budget->Reserve(1); });
+  // Replacing/shrinking a retained owner preserves its aggregate coverage.
+  retained.SetCommitted(0);
+  free += 50;
+  retained.Shrink(30);
+  retained.Clear();
+  peer = {};
+  Require(budget->Outstanding() == 0 && budget->PendingBytes() == 0,
+          "reset releases materialization markers and tickets once");
 }
 
 void ShrinkingReservations() {
-  auto budget = std::make_shared<vision::AdmissionBudget>(130, 30);
+  auto budget =
+      std::make_shared<vision::AdmissionBudget>([] { return 130; }, 30);
   vision::AdmissionLease image(budget);
   image.Grow(60);
   image.Grow(100);
@@ -239,7 +318,11 @@ void ShrinkingReservations() {
           "pool backing cannot be partially released");
 
   auto prep_budget = std::make_shared<vision::AdmissionBudget>(
-      vision::kPreparationScratchBytes + vision::kPreparedImageBytes + 10, 10);
+      [] {
+        return vision::kPreparationScratchBytes + vision::kPreparedImageBytes +
+               10;
+      },
+      10);
   {
     vision::PreparationReservation prep(prep_budget, 1);
     prep.Finish(123);
@@ -400,9 +483,11 @@ void LifetimeAndGrowth() {
   }
 }
 
-void ConcurrentReservations() {
+void ConcurrentReservations(bool on_demand) {
   constexpr std::size_t workers = 8;
-  auto budget = std::make_shared<vision::AdmissionBudget>(100);
+  auto budget =
+      on_demand ? std::make_shared<vision::AdmissionBudget>([] { return 100; })
+                : std::make_shared<vision::AdmissionBudget>(100);
   std::barrier start(workers + 1);
   std::latch attempted(workers), release(1);
   std::atomic<std::size_t> admitted = 0, refused = 0;
@@ -594,12 +679,15 @@ void PreparationLifetimes() {
 int main() {
   StartupPolicies();
   RecordedStartupFailure();
+  RecordedOnDemandCorrection();
   OnDemandObligations();
+  ObservationOrdering();
   ShrinkingReservations();
   StartupCapacitySelection();
   GeometryAndHistory();
   LifetimeAndGrowth();
-  ConcurrentReservations();
+  ConcurrentReservations(false);
+  ConcurrentReservations(true);
   AllocationFailuresAndCancellation();
   PreparedHistoryAndRestoredLayouts();
   PreparationLifetimes();

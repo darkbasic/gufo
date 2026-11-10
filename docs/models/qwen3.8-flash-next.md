@@ -86,11 +86,13 @@ additional memory for history, positions, encoder work and replacement peaks
 before allocation. The projector remains loaded; requests that cannot fit
 return `resource_exhausted`. Retained buffers keep their reservation until freed.
 
-On-demand admission protects the full configured RAM-cache allowance with lazy
-backing; images cannot borrow its unused capacity. Concurrent requests may
-refuse even if each fits alone. It does not guarantee that your session count
-fits physical memory. A launcher must forward `--vision-memory-policy on-demand`
-and omit `--vision-memory-bytes`.
+The RAM cache keeps its normal sizing, lazy backing and pressure checks. Gufo
+reports a reduced cache grant when the host cannot support your requested
+maximum. Image work, optional copies and backing growth share arrival-time
+admission; concurrent requests may refuse even if each fits alone. Text-session
+admission does not guarantee completed startup, your full cache target or image
+capacity. A launcher must forward `--vision-memory-policy on-demand` and omit
+`--vision-memory-bytes`.
 
 Omit both options or select `--vision-memory-policy conservative` to restore
 conservative admission. `--vision-memory-bytes 0` also means conservative;

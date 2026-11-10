@@ -1,13 +1,82 @@
 # Vision admission: recorded ZBook refusal
 
-This historical audit records the fixed-pool configuration and follow-up as of
-November 10, 2026, before the on-demand policy. That follow-up added production
-accounting tests and one consistent diagnostic, claiming **zero bytes of memory
-savings**. The measurements and results below remain evidence for that version;
-the [current policy](VISION-MEMORY.md) retains its failing regression and adds
-on-demand admission. Physical fit and GPU execution remain unverified by the VM.
+This page preserves the observed refusals from the fixed-pool and earlier
+on-demand implementations as of November 10, 2026. The
+[current policy](VISION-MEMORY.md) restores upstream text/cache stage boundaries;
+the broader on-demand refusal is historical evidence, not its acceptance rule.
+Physical fit and GPU execution remain unverified by the VM.
 
-## Recorded requirement
+## On-demand observation at 0825cdd
+
+The following same-phase values were reported for the deployed on-demand
+candidate. They must not be combined with earlier load-stage or later cleanup
+readings:
+
+```text
+policy=on-demand
+phase=post_fingerprint_pre_sessions
+hip_free_bytes=40497639424
+device_admission_bytes=40497639424
+device_host_margin_bytes=0
+host_available_bytes=38922952704
+cma_free_bytes=0
+cma_excluded_bytes=0
+cgroup_headroom_bytes=unknown
+host_reserve_bytes=4294967296
+host_ceiling_bytes=34627985408
+selected_limiter=host
+memory_capacity_bytes=34627985408
+sessions=4
+base_bytes=7527108948
+total_text_bytes=30108435792
+state_committed_bytes=0
+cache_committed_bytes=0
+vision_committed_bytes=0
+outstanding_bytes=0
+vision_startup_bytes=0
+cache_backing=lazy
+cache_reserved_bytes=4294967296
+deferred_scratch_bytes=418013184
+runtime_margin_bytes=536870912
+total_required_bytes=35358287184
+state_capacity_bytes=29378134016
+deficit_bytes=730301776
+refusal_reason=text_state_capacity
+result=refused
+```
+
+That policy required the full text claims, cache maximum, deferred scratch and
+extra runtime margin below the host/device minimum:
+
+```text
+30108435792 + 4294967296 + 418013184 + 536870912 = 35358287184
+35358287184 - 34627985408 = 730301776 bytes short
+```
+
+The corrected text gate uses the existing device-admission result and deducts
+deferred execution work once, with the text/MTP session estimate:
+
+```text
+40497639424 - 418013184 - 30108435792 = 9971190448 bytes headroom
+```
+
+This gate passes without changing any measured input. The platform-aware query
+still applies its existing Windows rules; this Linux observation happens to
+equal raw HIP free memory. Passing says nothing about later allocations, cache
+grant, backing growth or image eligibility.
+
+Under full-claim arithmetic a separate host constraint remains:
+
+```text
+38922952704 - 30108435792 - 4294967296 - 418013184 = 4101536432 bytes
+```
+
+That is about 3.820 GiB, or 184.47 MiB below the existing 4 GiB host reserve,
+before an additional 512 MiB margin. The owner still requires four full-context
+sessions and an effective 4 GiB cache; a reduced upstream cache grant does not
+qualify that workload. This correction claims no physical allocation saving.
+
+## Earlier fixed-pool requirement
 
 The final admission event supplies a selected capacity of 34,672,033,792 bytes.
 It does not identify which of the device budget and host ceiling selected that
@@ -158,11 +227,9 @@ cmake --preset release
 cmake --build --preset release --parallel 4
 ```
 
-The current candidate uses the [single owner workload attempt](VISION-MEMORY-VALIDATION.md#one-targeted-full-workload-attempt)
-to collect the final pair of limits and, only if admitted, exercise concurrent
-work. On-demand removes the fixed image deduction but keeps the full cache and
-safety obligations: 35,358,287,184 bytes are still required, leaving a
-686,253,392-byte deficit at this recorded capacity. Its lazy cache backing is
-described separately from the historical full-backing policy above. A repeated
-load without a changed candidate or concrete new hypothesis adds no required
-evidence. Numerical and physical-capacity qualification remain pending.
+The [single owner workload attempt](VISION-MEMORY-VALIDATION.md#one-targeted-full-workload-attempt)
+now distinguishes the narrower text gate, completed startup, effective cache
+grant/backing and image refusal/recovery. The historical fixed-pool arithmetic
+above remains unchanged; it does not define corrected on-demand acceptance.
+Repeated loads without a changed candidate or concrete new hypothesis add no
+required evidence. Numerical and physical-capacity qualification remain pending.

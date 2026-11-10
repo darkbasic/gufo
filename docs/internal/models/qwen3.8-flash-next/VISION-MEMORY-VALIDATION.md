@@ -33,7 +33,7 @@ is unavailable, leave execution pending; building needs no model load.
 
 ## Build and record inputs
 
-The real HIP release build of this on-demand change remains pending in the
+The real HIP release build of this corrective change remains pending in the
 development VM, which has no suitable ROCm/HIP toolchain. Prior candidate
 HIP/container results do not compile this diff. On a capable environment:
 
@@ -100,16 +100,28 @@ python3 tests/functional/vision_memory_admission.py \
 ```
 
 Retain `event=vision_admission policy=on-demand` at
-`phase=post_fingerprint_pre_sessions`. It must show `vision_startup_bytes=0`,
-the final raw HIP/device and host/CMA/cgroup inputs, reserves, selected limiter,
-loaded allocation scope, total requirement and deficit. The
-[recorded capacity](VISION-MEMORY-ADMISSION.md) still yields a 686,253,392-byte
-on-demand deficit; the change does not manufacture a fit. Do not substitute an
+`phase=post_fingerprint_pre_sessions`. It must show `vision_startup_bytes=0`
+and distinguish the device text-state gate from the host/device breakdown used
+for runtime admission. The [same-phase recorded inputs](VISION-MEMORY-ADMISSION.md#on-demand-observation-at-0825cdd)
+pass the corrected text gate with 9,971,190,448 bytes of headroom; its previous
+730,301,776-byte combined refusal is historical evidence. Do not substitute an
 earlier `vision_prepared` or later cleanup `load_failed` reading.
 
+Read the attempt in four stages: text-state eligibility, completed model
+startup/readiness, effective cache grant and backing, then image admission and
+refusal with recovery. Passing one stage does not qualify the next. The harness
+saves these separately under `startup_stages`, including trim and backing
+pressure events even on failure. Existing engine policy may legitimately trim
+the cache or limit its growth; this **does not qualify the owner's 4 GiB target**.
+After the requests finish, `cache_growth_qualification` checks both logs for
+`ram_cache_trimmed` or `backing_limited`. Either makes the overall qualification
+fail even if `functional_workload=passed`; later successful growth does not
+erase the pressure evidence. An expected image `resource_exhausted` refusal is
+checked separately and is not treated as a cache-growth failure.
+
 If startup refuses, **stop this attempt and return its log and report**. The
-new evidence is the exact final pair of limits and whether the on-demand total
-fits with the required auxiliary services present. Do not repeat full loads,
+new evidence is which stage failed under the corrected source revision, with
+its current capacities and the required auxiliary services present. Do not repeat full loads,
 clear caches, change budgets or stop auxiliary services to seek readiness.
 Restore production chat only after the candidate has exited. A future attempt
 needs a changed candidate or a concrete capacity hypothesis to test.
@@ -142,7 +154,7 @@ this qualification. The harness requires:
   tokens, its greedy continuation matches the RAM result, and text still works.
 
 The pressure request defaults to five 4096 × 4096 images. On-demand capacity
-depends on the protected obligations and retained peers, so this count is not
+depends on runtime observations, pending obligations and retained peers, so this count is not
 a guaranteed exhaustion threshold. `--pressure-images N` before the separator
 selects 1–15 images within context. If the request is admitted, refusal
 qualification fails and retains that evidence; do not report a refusal pass or
@@ -184,9 +196,16 @@ or service changes are part of this procedure.
 
 ## Policy compatibility
 
-An external Python launcher must forward `--vision-memory-policy on-demand`
-to the native `serve llm` command and omit `--vision-memory-bytes`. The launcher
-is not changed by this patch. To restore conservative admission, remove both
+The existing workstation recipe already forwards `--vision-memory-policy
+on-demand`. Add the corrective source revision after `0825cdd0977a5c3e8749f55c8435b628f2bf9500`
+to that recipe's candidate source selection when the patch is reviewed and
+committed; do not reapply earlier fixes or change its workload options. Record
+the resulting revision/build provenance. This VM patch does not edit the kit or
+invent launcher commands. Keep any existing launcher check for four sessions
+and a full 4 GiB effective cache: engine readiness alone does not satisfy it.
+
+A launcher must forward the native policy option and omit
+`--vision-memory-bytes`. To restore conservative admission, remove both
 options or pass `--vision-memory-policy conservative` without a positive byte
 pool. Legacy `--vision-memory-bytes 0` also remains conservative.
 

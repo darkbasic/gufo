@@ -26,6 +26,7 @@
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/image_cache.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
+#include "src/models/qwen38_flash_next/cache_admission.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/continuation_identity.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
@@ -312,8 +313,9 @@ void LogVisionAdmission(
         qwen::vision::CheckedMultiply(state.TotalBytes(), sessions));
     if (plan) {
       total_required = std::to_string(plan->RequiredBytes(sessions));
-      deficit = std::to_string(
-          plan->DeficitBytes(sessions, snapshot.capacity.available_bytes));
+      deficit = std::to_string(plan->DeficitBytes(
+          sessions,
+          on_demand ? device.free_bytes : snapshot.capacity.available_bytes));
     }
   } catch (const core::ResourceAdmissionError&) {
     total_required = deficit = "overflow";
@@ -349,7 +351,12 @@ void LogVisionAdmission(
           " host_limiter=" + (host.cgroup_limited ? "cgroup" : "host") +
           " host_reserve_bytes=" + std::to_string(host.reserve_bytes) +
           " host_ceiling_bytes=" + std::to_string(host.ceiling_bytes) +
+          " limiter_scope=" + (on_demand ? "runtime_observation" : "startup") +
           " selected_limiter=" + snapshot.capacity.LimiterName() +
+          " gate=" + (on_demand ? "device_state" : "combined_fixed_pool") +
+          " state_admission_bytes=" +
+          std::to_string(on_demand ? device.free_bytes
+                                   : snapshot.capacity.available_bytes) +
           " memory_capacity_bytes=" +
           std::to_string(snapshot.capacity.available_bytes) +
           " loaded_allocation_scope=explicit_requested_bytes "
@@ -373,15 +380,16 @@ void LogVisionAdmission(
           " state_committed_bytes=0 cache_committed_bytes=0 "
           "vision_committed_bytes=0"
           " outstanding_bytes=0 vision_capacity_bytes=" +
-          std::to_string(on_demand && eligible
-                             ? snapshot.capacity.available_bytes -
-                                   plan->RequiredBytes(sessions)
-                             : vision_bytes) +
+          (on_demand ? std::string("arrival_time")
+                     : std::to_string(vision_bytes)) +
           " vision_startup_bytes=" + std::to_string(vision_bytes) +
           " cache_backing=" + (on_demand ? "lazy" : "full") +
-          " cache_reserved_bytes=" + std::to_string(cache_bytes) +
+          " cache_requested_bytes=" + std::to_string(cache_bytes) +
+          " cache_reserved_bytes=" +
+          std::to_string(on_demand ? 0 : cache_bytes) +
           " deferred_scratch_bytes=" +
           std::to_string(model.DeferredScratchBytes()) +
+          " runtime_margin_scope=" + (on_demand ? "arrival_time" : "startup") +
           " runtime_margin_bytes=" + std::to_string(kVisionRuntimeMargin) +
           " uncommitted_shared_bytes=" +
           (plan ? std::to_string(plan->shared_reservation_bytes) : "unknown") +
@@ -420,9 +428,12 @@ public:
             "request-aware admission needs a startup snapshot");
       const auto mode = use_mtp_ ? core::SessionMode::kSpeculative
                                  : core::SessionMode::kAutoregressive;
-      // CPU preprocessing and device execution share the host/cgroup ceiling
-      // on unified memory. Both capacities must fund the entire partition.
-      const auto available = startup_memory->capacity.available_bytes;
+      // Text uses the existing platform-aware device gate. Host/cache limits
+      // are checked by their existing paths after slots allocate, not combined
+      // into a new prerequisite for text startup.
+      const auto available = on_demand
+                                 ? startup_memory->device.free_bytes
+                                 : startup_memory->capacity.available_bytes;
       try {
         vision_plan_ = qwen::vision::PlanStartupMemory(
             available, model_->DeferredScratchBytes(),
@@ -443,20 +454,23 @@ public:
                          max_context_, session_count, vision_memory_bytes,
                          cache_reserve_bytes, on_demand);
       if (on_demand) {
-        if (!vision_plan_->Fits(session_count))
-          throw core::ResourceAdmissionError(
-              "vision memory admission refused: reason=text_state_capacity "
-              "deficit_bytes=" +
-              std::to_string(
-                  vision_plan_->DeficitBytes(session_count, available)));
-        // Protect all remaining text/cache/scratch obligations once, before
-        // any of them commit. Images and optional device checkpoint copies
-        // share the remainder. No image capacity is charged at startup and
-        // physical commitment never replenishes this model-lifetime epoch.
-        vision_budget_ = std::make_shared<qwen::vision::AdmissionBudget>(
-            available, vision_plan_->RequiredBytes(session_count));
-        funded_text_bytes_ = qwen::vision::CheckedMultiply(
+        // These are accepted execution obligations, not a startup reserve
+        // against the host/cache ceiling. Actual commitment reduces pending
+        // obligations. Optional cache growth reserves only each arriving
+        // segment through the same coordinator as images and private copies.
+        configured_text_bytes_ = qwen::vision::CheckedMultiply(
             vision_plan_->per_session_bytes, session_count);
+        const auto execution = qwen::vision::CheckedAdd(
+            configured_text_bytes_, model_->DeferredScratchBytes());
+        vision_budget_ = std::make_shared<qwen::vision::AdmissionBudget>(
+            [] {
+              const auto snapshot = CollectStartupMemory();
+              const auto remaining = snapshot.capacity.available_bytes;
+              return remaining > kVisionRuntimeMargin
+                         ? remaining - kVisionRuntimeMargin
+                         : 0;
+            },
+            execution);
       } else {
         vision_budget_ = std::make_shared<qwen::vision::AdmissionBudget>(
             vision_memory_bytes);
@@ -465,8 +479,7 @@ public:
           model_->DeferredScratchBytes(), kVisionRuntimeMargin);
       // Fixed-pool compatibility protects its capacity in the legacy snapshot
       // path. On-demand snapshot copies acquire the same aggregate tickets as
-      // images instead; cache backing may remain lazy within its protected
-      // grant.
+      // images and cache backing segments instead.
       model_->SetVisionMemoryBudget(vision_budget_, vision_memory_bytes);
     }
     // The typed in-process API owns an immutable loaded model but need not
@@ -490,39 +503,25 @@ public:
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
-    if (vision_budget_ && required_cache_bytes_ > ram)
-      throw core::ResourceAdmissionError(
-          "vision memory admission refused: reason=cache_grant "
-          "requested_bytes=" +
-          std::to_string(required_cache_bytes_) +
-          " granted_bytes=" + std::to_string(ram));
+    ValidateVisionCacheGrant(vision_budget_, required_cache_bytes_, ram);
     if (vision_budget_)
       vision_budget_->ClaimExecutionOwner();
-    auto hooks = HipComponentCacheHooks();
+    auto hooks = VisionCacheHooks(
+        HipComponentCacheHooks(), vision_budget_,
+        [protected_bytes = execution_headroom_bytes_] {
+          const auto memory = gufo::hip::QueryAdmissionMemory();
+          const auto ceiling =
+              memory ? std::min<std::size_t>(HostSnapshotCeilingBytes(),
+                                             memory->free_bytes)
+                     : 0;
+          return ceiling > protected_bytes ? ceiling - protected_bytes : 0;
+        });
     if (vision_budget_) {
-      hooks.require_full_backing = !vision_budget_->OnDemand();
       hooks.info = [](std::string_view message) {
         server::Logger::Info("cache", std::string(message));
       };
       hooks.warn = [](std::string_view message) {
         server::Logger::Warn("cache", std::string(message));
-      };
-      // The full cache grant is protected even when backing remains lazy.
-      // These live checks may refuse external pressure but never enlarge the
-      // epoch. Do not subtract image charges here: they may already be
-      // committed and the aggregate ledger keeps them outside the cache's
-      // allowance. On-demand scratch is already funded by the epoch; after
-      // commitment a second deduction would block funded cache growth. The
-      // fixed-pool policy retains its original frozen scratch check.
-      hooks.host_ceiling = [protected_bytes = vision_budget_->OnDemand()
-                                                  ? kVisionRuntimeMargin
-                                                  : execution_headroom_bytes_] {
-        const auto memory = gufo::hip::QueryAdmissionMemory();
-        const auto ceiling =
-            memory ? std::min<std::size_t>(HostSnapshotCeilingBytes(),
-                                           memory->free_bytes)
-                   : 0;
-        return ceiling > protected_bytes ? ceiling - protected_bytes : 0;
       };
     }
     auto resources = hip::CreateHipComponentCacheResources(
@@ -535,19 +534,15 @@ public:
     if (vision_budget_) {
       const auto commit = resources->commit_backing;
       resources->commit_backing =
-          [commit, on_demand = vision_budget_->OnDemand(),
-           required = required_cache_bytes_,
+          [commit, budget = vision_budget_, required = required_cache_bytes_,
            reserved = cache_reserve_bytes_](std::size_t granted) {
-            if (granted < required || granted > reserved)
-              throw core::ResourceAdmissionError(
-                  "vision memory admission refused: reason=cache_grant "
-                  "requested_bytes=" +
-                  std::to_string(required) +
-                  " granted_bytes=" + std::to_string(granted));
+            ValidateVisionCacheGrant(budget, required, granted, reserved);
             commit(granted);
+            const auto on_demand = budget->OnDemand();
             server::Logger::Info(
                 "loader", std::string("event=vision_cache_grant policy=") +
                               (on_demand ? "on-demand" : "request-aware") +
+                              " requested_bytes=" + std::to_string(required) +
                               " granted_bytes=" + std::to_string(granted) +
                               " backing=" + (on_demand ? "lazy" : "full"));
           };
@@ -608,13 +603,8 @@ public:
     const auto session_bytes =
         vision_plan_ ? vision_plan_->per_session_bytes : legacy_session_bytes;
     std::optional<std::size_t> capacity;
-    if (vision_plan_) {
+    if (vision_plan_ && !vision_budget_->OnDemand()) {
       capacity = vision_plan_->state_capacity_bytes;
-      // An in-process caller may request a different pool size than the
-      // options used to create this runner. Never admit additional slots
-      // against memory already made available to on-demand requests.
-      if (vision_budget_->OnDemand())
-        capacity = std::min(*capacity, funded_text_bytes_);
     } else if (const auto memory = gufo::hip::QueryAdmissionMemory()) {
       const auto deferred = model_->DeferredScratchBytes();
       capacity =
@@ -625,20 +615,22 @@ public:
                    : core::SessionMode::kAutoregressive,
           max_context_);
       server::Logger::Debug(
-          "loader", "event=vision_admission policy=conservative base_bytes=" +
-                        std::to_string(base) + " vision_claim_bytes=" +
-                        std::to_string(session_bytes - base) +
-                        " outstanding_bytes=0 state_capacity_bytes=" +
-                        std::to_string(*capacity));
+          "loader",
+          std::string(vision_budget_ && vision_budget_->OnDemand()
+                          ? "event=vision_state_gate policy=on-demand"
+                          : "event=vision_admission policy=conservative") +
+              " base_bytes=" + std::to_string(base) +
+              " vision_claim_bytes=" + std::to_string(session_bytes - base) +
+              " outstanding_bytes=0 state_capacity_bytes=" +
+              std::to_string(*capacity));
     }
+    // A typed caller must not create more slots than the configuration whose
+    // execution obligations the coordinator tracks. This count bound does not
+    // couple text admission to host/cache/runtime-image limits.
+    if (capacity && vision_budget_ && vision_budget_->OnDemand())
+      capacity = std::min(*capacity, configured_text_bytes_);
     auto ceiling = HostSnapshotCeilingBytes();
-    if (vision_budget_ && vision_budget_->OnDemand()) {
-      // The grant is already funded in the immutable aggregate epoch. The
-      // serving cache subtracts its fixed disk staging from this ceiling;
-      // staging/metadata live in the unchanged runtime margin, not the grant.
-      ceiling =
-          qwen::vision::CheckedAdd(cache_reserve_bytes_, kVisionRuntimeMargin);
-    } else if (vision_budget_) {
+    if (vision_budget_ && !vision_budget_->OnDemand()) {
       const auto reserved = qwen::vision::CheckedAdd(
           execution_headroom_bytes_, vision_budget_->Capacity());
       ceiling = ceiling > reserved ? ceiling - reserved : 0;
@@ -653,9 +645,9 @@ public:
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes =
-            vision_budget_ && vision_budget_->OnDemand() ? cache_reserve_bytes_
-            : vision_budget_ ? std::min(HostSnapshotBudgetBytes(), ceiling)
-                             : HostSnapshotBudgetBytes(),
+            vision_budget_ && !vision_budget_->OnDemand()
+                ? std::min(HostSnapshotBudgetBytes(), ceiling)
+                : HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = ceiling,
         .requires_device_runtime_lock = true,
     };
@@ -1090,10 +1082,10 @@ private:
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  std::size_t configured_text_bytes_{0};
   std::size_t cache_reserve_bytes_{0};
   std::size_t required_cache_bytes_{0};
   std::size_t execution_headroom_bytes_{0};
-  std::size_t funded_text_bytes_{0};
   std::optional<qwen::vision::StartupMemoryPlan> vision_plan_;
   std::shared_ptr<qwen::vision::AdmissionBudget> vision_budget_;
   cache::Identity component_identity_;
@@ -1200,8 +1192,9 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
       *error = e.what();
     return nullptr;
   }
-  // Disk-only captures still use bounded host backing. The commit wrapper
-  // refuses any grant beyond this reserve before the backing is allocated.
+  // Fixed-pool admission reserves the configured cache bound, including
+  // disk-only capture backing. On-demand keeps this value for diagnostics;
+  // upstream cache sizing and post-slot host rechecks determine its grant.
   const auto cache_reserve =
       !options.ram_cache.enabled
           ? (options.disk_cache.directory.empty() ? 0 : std::size_t{512} << 20)
@@ -1281,7 +1274,8 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
           const auto mode = core::SessionMode::kSpeculative;
           try {
             const auto plan = qwen::vision::PlanStartupMemory(
-                startup_memory->capacity.available_bytes,
+                on_demand ? startup_memory->device.free_bytes
+                          : startup_memory->capacity.available_bytes,
                 model->DeferredScratchBytes(),
                 model->TextSessionBytes(mode, max_context),
                 model->SessionBytes(mode, max_context), vision_memory_bytes,

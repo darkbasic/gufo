@@ -98,6 +98,20 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
       limited->refused = std::chrono::steady_clock::now();
       return false;
     };
+    std::function<cache::ResourceReservation(std::size_t)> reserve_segment;
+    if (hooks.reserve_segment) {
+      reserve_segment = [limited, refuse,
+                         reserve = hooks.reserve_segment](std::size_t bytes) {
+        try {
+          return reserve(bytes);
+        } catch (const core::ResourceAdmissionError& error) {
+          const std::lock_guard lock(limited->mutex);
+          refuse("shared_reservation segment_bytes=" + std::to_string(bytes) +
+                 " detail=" + error.what());
+          throw cache::ResourceExhausted();
+        }
+      };
+    }
     backing->pool = std::make_unique<hip::CommittedBackingPool>(
         ledger,
         hip::BackingPoolConfig{
@@ -142,7 +156,8 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
                   "device_heap_reserve segment_bytes=" + std::to_string(bytes) +
                   " device_heap_free_bytes=" + std::to_string(heap_before) +
                   " device_heap_after_bytes=" + std::to_string(heap_after));
-            }});
+            },
+            std::move(reserve_segment)});
     // Prepare a bounded reserve before readiness. The first shared-prefix
     // capture needs more than one segment; preparing 2 GiB avoids moving
     // registration onto that request's capture or decode path.

@@ -5,9 +5,11 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <latch>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,10 +18,13 @@
 #include "src/core/hip/component_cache_resources.hpp"
 #include "src/core/resource_error.hpp"
 #include "src/families/qwen/vision/admission.hpp"
+#include "src/models/qwen38_flash_next/cache_admission.hpp"
 #include "tests/cache/fake_adapter.hpp"
 
 namespace {
 std::map<void*, std::size_t> registered;
+std::atomic<std::size_t> registered_bytes{};
+std::function<void()> verify_segment_ownership;
 bool fail_registration{}, fail_query{};
 constexpr std::size_t kPayloadBytes = 4 * 4096;
 constexpr std::size_t kMetadataBytes = 16384;
@@ -89,14 +94,17 @@ void OnDemandLazyBacking(bool inject_registration_failure) {
   using namespace gufo;
   constexpr std::size_t block = 4096;
   constexpr std::size_t cache_bytes = kPayloadBytes + kMetadataBytes;
-  constexpr std::size_t text_bytes = block;
-  constexpr std::size_t scratch_bytes = block;
-  constexpr std::size_t margin_bytes = block;
+  constexpr std::size_t execution_bytes = block;
   constexpr std::size_t image_bytes = 2 * block;
-  constexpr std::size_t protected_bytes =
-      cache_bytes + text_bytes + scratch_bytes + margin_bytes;
-  constexpr std::size_t capacity = protected_bytes + image_bytes;
-  models::qwen::vision::AdmissionBudget admission(capacity, protected_bytes);
+  // Enough for the cache OR mixed images and partial backing. The configured
+  // cache maximum is optional growth, not an upfront execution obligation.
+  constexpr std::size_t available = execution_bytes + kPayloadBytes;
+  std::atomic<std::size_t> image_committed{};
+  models::qwen::vision::AdmissionBudget admission(
+      [&] {
+        return available - registered_bytes.load() - image_committed.load();
+      },
+      execution_bytes);
   cache::ResourceLedger cache_ledger({cache_bytes, cache_bytes, 0, 0});
   fail_registration = false;
   fail_query = false;
@@ -126,28 +134,25 @@ void OnDemandLazyBacking(bool inject_registration_failure) {
                if (synchronize_growth.exchange(false)) {
                  start.arrive_and_wait();
                  image_live.wait();
-                 assert(admission.AccountedBytes() == capacity);
                }
-               // Physical growth spends the cache allowance already protected
-               // in the shared epoch. It never competes for the image
-               // remainder.
                return true;
              },
          .keep_segment =
              [](std::size_t, std::size_t before, std::size_t after) {
                return hip::RegistrationKeepsReserve(before, after);
+             },
+         .reserve_segment =
+             [&](std::size_t bytes) {
+               return admission.ReserveShared(bytes);
              }});
     assert(!pool.CommittedBytes());
-    assert(admission.AccountedBytes() == protected_bytes);
+    assert(admission.ProtectedBytes() == execution_bytes);
     assert(!admission.Outstanding());
     pool.GrowAhead(block);
     pool.WaitForGrowth();
     assert(pool.CommittedBytes() == block);
-    assert(cache_ledger.Snapshot().total_bytes == kMetadataBytes + block);
-    // Most payload is uncommitted, but its full configured allowance is not
-    // available for images. The fake HIP reading stays optimistically high.
-    refused(false, image_bytes + 1);
-    assert(admission.AccountedBytes() == protected_bytes);
+    assert(admission.Outstanding() == block);
+    assert(!admission.PendingBytes());
 
     synchronize_growth = true;
     fail_registration = inject_registration_failure;
@@ -155,57 +160,188 @@ void OnDemandLazyBacking(bool inject_registration_failure) {
       start.arrive_and_wait();
       auto reservation = admission.Reserve(image_bytes);
       std::vector<std::byte> pixels(image_bytes);
+      image_committed = image_bytes;
+      auto charge = reservation.Convert();
       image_live.count_down();
       release_image.wait();
-      // Pixels are destroyed before the reservation leaves this scope.
+      std::vector<std::byte>().swap(pixels);
+      image_committed = 0;
+      charge = {};
     });
     pool.GrowAhead(kPayloadBytes);
     pool.WaitForGrowth();
     assert(pool.CommittedBytes() ==
-           (inject_registration_failure ? block : kPayloadBytes));
+           (inject_registration_failure ? block : 2 * block));
     assert(cache_ledger.Snapshot().total_bytes ==
            kMetadataBytes + pool.CommittedBytes());
-    assert(registered.size() == pool.CommittedBytes() / block);
-    assert(admission.AccountedBytes() == capacity);
-    assert(admission.Outstanding() == image_bytes);
-    refused(false, 1);
-    refused(true, 1);
+    assert(registered_bytes == pool.CommittedBytes());
+    assert(!admission.PendingBytes());
     if (inject_registration_failure) {
-      // One explicit recovery after removing the injected fault, not a loop
-      // that waits for a favorable capacity observation or hides a failure.
+      // The failed physical allocation leaked neither a pending reservation
+      // nor a committed charge. One explicit recovery follows fault removal.
       fail_registration = false;
       pool.GrowAhead(kPayloadBytes);
       pool.WaitForGrowth();
-      assert(pool.CommittedBytes() == kPayloadBytes);
-      assert(cache_ledger.Snapshot().total_bytes == cache_bytes);
-      assert(admission.AccountedBytes() == capacity);
-      refused(false, 1);
+      assert(pool.CommittedBytes() == 2 * block);
     }
+    assert(admission.Outstanding() == 2 * block + image_bytes);
+    refused(false, 1);
+    refused(true, 1);
     release_image.count_down();
     image.join();
-    assert(!admission.Outstanding());
-    assert(admission.AccountedBytes() == protected_bytes);
+    assert(admission.Outstanding() == 2 * block);
+    // Fresh observation reflects committed backing exactly once. Growth can
+    // reuse released image capacity, but cannot spend the execution allowance.
+    pool.GrowAhead(kPayloadBytes);
+    pool.WaitForGrowth();
     assert(pool.CommittedBytes() == kPayloadBytes);
-    // Text/scratch use their protected allowance while cached backing stays
-    // physically committed. Another image can reuse only the same remainder.
-    std::vector<std::byte> text(text_bytes), scratch(scratch_bytes);
+    assert(admission.Outstanding() == kPayloadBytes);
+    assert(!admission.PendingBytes());
+    refused(false, 1);
+    refused(true, 1);
     auto checkpoint =
         pool.TryAcquire(cache::ResourceCategory::kPrivateState, 32);
     assert(checkpoint);
     checkpoint->Bytes().front() = std::byte{7};
     checkpoint->Convert();
-    {
-      auto reservation = admission.Reserve(image_bytes);
-      std::vector<std::byte> pixels(image_bytes);
-      assert(admission.AccountedBytes() == capacity);
-      refused(false, 1);
-    }
-    assert(!admission.Outstanding());
-    assert(cache_ledger.Snapshot().total_bytes == cache_bytes);
   }
-  assert(registered.empty() && !cache_ledger.Snapshot().total_bytes);
-  assert(admission.AccountedBytes() == protected_bytes);
+  assert(registered.empty() && !registered_bytes);
+  assert(!cache_ledger.Snapshot().total_bytes && !admission.Outstanding());
+  // A previous refusal does not poison later work or the reservation ledger.
+  auto image = admission.Reserve(image_bytes);
+  assert(admission.PendingBytes() == image_bytes);
 }
+
+void OnDemandHooksKeepLazyReducedGrants(bool image_pressure) {
+  using namespace gufo;
+  using namespace gufo::models::qwen38_flash_next;
+  constexpr std::size_t execution = 4096;
+  const auto admission =
+      std::make_shared<models::qwen::vision::AdmissionBudget>(
+          [] { return execution + kPayloadBytes - registered_bytes.load(); },
+          execution);
+  cache::ResourceLedger ledger(
+      {kBudgetBytes, kBudgetBytes, kBudgetBytes, kBudgetBytes});
+  auto image =
+      image_pressure ? admission->Reserve(4096) : cache::ResourceReservation{};
+  std::string warnings, info;
+  {
+    hip::ComponentCacheHooks hooks;
+    hooks.transfer_streams = 1;
+    hooks.host_ceiling = [] { return kBudgetBytes; };
+    hooks.warn = [&](std::string_view message) { warnings += message; };
+    hooks.info = [&](std::string_view message) { info += message; };
+    hooks = VisionCacheHooks(std::move(hooks), admission, [] { return 0; });
+    assert(hooks.host_ceiling() == kBudgetBytes);
+    assert(!hooks.require_full_backing);
+    auto resources = hip::CreateHipComponentCacheResources(
+        std::make_unique<Adapter>(), ledger, std::move(hooks));
+    // Shared serving may grant less than the requested maximum after slots
+    // allocate. The actual production hook accepts that grant unchanged.
+    ValidateVisionCacheGrant(admission, kBudgetBytes, kBudgetBytes / 2);
+    ValidateVisionCacheGrant(admission, kBudgetBytes, kBudgetBytes / 2,
+                             kBudgetBytes);
+    resources->commit_backing(kBudgetBytes / 2);
+    assert(info.find("required_payload_bytes") == std::string::npos);
+    assert(registered_bytes == (image_pressure ? 0 : kPayloadBytes));
+    if (image_pressure) {
+      assert(warnings.find("event=backing_limited reason=shared_reservation") !=
+             std::string::npos);
+      assert(admission->Outstanding() == 4096);
+    } else {
+      assert(warnings.empty());
+      assert(admission->Outstanding() == kPayloadBytes);
+      assert(!admission->PendingBytes());
+    }
+  }
+  image = {};
+  assert(!registered_bytes && !admission->Outstanding());
+}
+
+void CachePolicyCompatibility() {
+  using namespace gufo;
+  using namespace gufo::models::qwen38_flash_next;
+  hip::ComponentCacheHooks upstream;
+  upstream.host_ceiling = [] { return kBudgetBytes; };
+  const auto ordinary = VisionCacheHooks(upstream, {}, [] { return 0; });
+  assert(ordinary.host_ceiling() == kBudgetBytes);
+  assert(!ordinary.require_full_backing && !ordinary.reserve_segment);
+  ValidateVisionCacheGrant({}, kBudgetBytes, kBudgetBytes / 2, kBudgetBytes);
+
+  const auto fixed =
+      std::make_shared<models::qwen::vision::AdmissionBudget>(kBudgetBytes);
+  const auto legacy =
+      VisionCacheHooks(upstream, fixed, [] { return kPayloadBytes; });
+  assert(legacy.host_ceiling() == kPayloadBytes);
+  assert(legacy.require_full_backing && !legacy.reserve_segment);
+  ValidateVisionCacheGrant(fixed, kBudgetBytes, kBudgetBytes, kBudgetBytes);
+  for (const auto granted : {kBudgetBytes - 1, kBudgetBytes + 1}) {
+    bool refused = false;
+    try {
+      ValidateVisionCacheGrant(fixed, kBudgetBytes, granted, kBudgetBytes);
+    } catch (const core::ResourceAdmissionError& error) {
+      refused = std::string_view(error.what()).find("reason=cache_grant") !=
+                std::string_view::npos;
+    }
+    assert(refused);
+  }
+}
+
+void SegmentTicketFailureAndLifetime(int failure) {
+  using namespace gufo;
+  constexpr std::size_t block = 4096;
+  constexpr std::size_t cache_bytes = kMetadataBytes + kPayloadBytes;
+  cache::ResourceLedger cache_ledger({cache_bytes, cache_bytes, 0, 0});
+  const auto shared_capacity = failure == 1 ? 0 : kPayloadBytes;
+  cache::ResourceLedger shared({shared_capacity, shared_capacity, 0, 0});
+  if (failure == 4)
+    shared.FailAfter(cache::LedgerStep::kConvert, 0);
+  fail_registration = failure == 2;
+  fail_query = false;
+  verify_segment_ownership = [&] {
+    // Both at physical allocation and at release, the corresponding shared
+    // reservation/charge must still exist. No early accounting release.
+    assert(shared.Snapshot().total_bytes >= registered_bytes.load());
+  };
+  std::optional<hip::BackingBlock> retained;
+  {
+    hip::CommittedBackingPool pool(
+        cache_ledger,
+        {.ram_bytes = cache_bytes,
+         .block_bytes = block,
+         .metadata_headroom_bytes = kMetadataBytes,
+         .segment_bytes = block,
+         .admit_segment = {},
+         .keep_segment =
+             [failure](std::size_t, std::size_t, std::size_t) {
+               if (failure == 5)
+                 throw std::bad_alloc();
+               if (failure == 6)
+                 throw std::runtime_error("injected post-registration failure");
+               return failure != 3;
+             },
+         .reserve_segment =
+             [&](std::size_t bytes) {
+               return shared.Reserve(cache::ResourceCategory::kPrivateTail,
+                                     bytes);
+             }});
+    pool.GrowAhead(block);
+    pool.WaitForGrowth();
+    assert(pool.CommittedBytes() == (failure ? 0 : block));
+    assert(shared.Snapshot().total_bytes == pool.CommittedBytes());
+    if (!failure)
+      retained = pool.TryAcquire(cache::ResourceCategory::kPrivateState, 32);
+  }
+  // A capture owner can outlive the pool facade. Its registered segment and
+  // shared accounting must survive together until the last physical user.
+  assert(shared.Snapshot().total_bytes == (failure ? 0 : block));
+  assert(registered_bytes == (failure ? 0 : block));
+  retained.reset();
+  assert(!shared.Snapshot().total_bytes && !registered_bytes);
+  verify_segment_ownership = {};
+  fail_registration = false;
+}
+
 }  // namespace
 
 hipError_t hipHostMalloc(void** pointer, std::size_t bytes, unsigned) {
@@ -220,9 +356,15 @@ hipError_t hipHostRegister(void* pointer, std::size_t bytes, unsigned) {
   if (fail_registration)
     return hipErrorOutOfMemory;
   registered.emplace(pointer, bytes);
+  registered_bytes.fetch_add(bytes);
+  if (verify_segment_ownership)
+    verify_segment_ownership();
   return hipSuccess;
 }
 hipError_t hipHostUnregister(void* pointer) {
+  if (verify_segment_ownership)
+    verify_segment_ownership();
+  registered_bytes.fetch_sub(registered.at(pointer));
   assert(registered.erase(pointer) == 1);
   return hipSuccess;
 }
@@ -274,4 +416,9 @@ int main() {
   }
   OnDemandLazyBacking(false);
   OnDemandLazyBacking(true);
+  OnDemandHooksKeepLazyReducedGrants(false);
+  OnDemandHooksKeepLazyReducedGrants(true);
+  CachePolicyCompatibility();
+  for (int failure = 0; failure <= 6; ++failure)
+    SegmentTicketFailureAndLifetime(failure);
 }

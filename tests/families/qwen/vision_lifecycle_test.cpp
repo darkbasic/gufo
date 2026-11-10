@@ -255,6 +255,18 @@ void DeviceInput::LaunchRows(float* hidden, const float* embedding,
 
 namespace {
 constexpr std::uint32_t kWidth = 2560;
+std::shared_ptr<vision::AdmissionBudget> RuntimeBudget(
+    std::size_t capacity, std::size_t execution = 0) {
+  auto owner = std::make_shared<std::weak_ptr<vision::AdmissionBudget>>();
+  auto budget = std::make_shared<vision::AdmissionBudget>(
+      [owner, capacity] {
+        const auto committed = fake::DynamicBytes(owner->lock());
+        return committed < capacity ? capacity - committed : 0;
+      },
+      execution);
+  *owner = budget;
+  return budget;
+}
 std::shared_ptr<vision::Prompt> Prompt(std::uint32_t offset = 2,
                                        std::uint32_t side = 32) {
   auto image = std::make_shared<gufo::core::Image>();
@@ -278,6 +290,7 @@ std::shared_ptr<vision::Prompt> AdmittedPrompt(
   // budget.
   struct Owner {
     gufo::cache::ResourceReservation admission;
+    gufo::cache::ResourceCharge committed;
     std::shared_ptr<const gufo::core::Image> pixels;
     Owner(const std::shared_ptr<vision::AdmissionBudget>& budget,
           std::shared_ptr<const gufo::core::Image> image)
@@ -285,6 +298,8 @@ std::shared_ptr<vision::Prompt> AdmittedPrompt(
           pixels(std::move(image)) {
       fake::TrackHost(const_cast<std::uint8_t*>(pixels->pixels.data()),
                       pixels->pixels.capacity(), budget);
+      if (budget->OnDemand())
+        committed = admission.Convert();
     }
     ~Owner() {
       Require(pixels.use_count() == 1,
@@ -584,8 +599,7 @@ void Cancellation() {
 void ConcurrentInputs(bool on_demand = false) {
   const auto prompt = Prompt();
   auto budget = on_demand
-                    ? std::make_shared<vision::AdmissionBudget>(
-                          4096 + Peak(*prompt), 4096)
+                    ? RuntimeBudget(4096 + Peak(*prompt), 4096)
                     : std::make_shared<vision::AdmissionBudget>(Peak(*prompt));
   fake::budget = budget;
   auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
@@ -625,8 +639,7 @@ void OnDemandRetentionAndOwnership() {
   constexpr std::size_t protected_bytes = 4096;
   const auto unowned = Prompt();
   const auto capacity = Peak(*unowned);
-  auto budget = std::make_shared<vision::AdmissionBudget>(
-      protected_bytes + capacity, protected_bytes);
+  auto budget = RuntimeBudget(protected_bytes + capacity, protected_bytes);
   fake::budget = budget;
   auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
   auto prompt = AdmittedPrompt(budget);
@@ -655,6 +668,9 @@ void OnDemandRetentionAndOwnership() {
     Require(budget->Outstanding() == retained &&
                 fake::DynamicBytes(budget) == retained,
             "on-demand releases encoder peak only after scratch is freed");
+    Require(budget->PendingBytes() == 0,
+            "materialized pixels, positions and embeddings are not deducted "
+            "again from a fresh free-memory observation");
     // Spend every newly available byte. A same-layout image continuation must
     // reuse retained embeddings without trying to reacquire encoder scratch.
     auto competing = budget->Reserve(capacity - retained);
@@ -691,8 +707,7 @@ void OnDemandRetentionAndOwnership() {
 }
 
 void CopiedPreparedPixels() {
-  auto budget =
-      std::make_shared<vision::AdmissionBudget>((2U << 20) + 4096, 4096);
+  auto budget = RuntimeBudget((2U << 20) + 4096, 4096);
   {
     auto prompt = Prompt();
     const auto original = prompt->images.front().pixels;
@@ -739,8 +754,7 @@ void CopiedPreparedPixels() {
 
 void OnDemandGrowthHistoryAndFailures() {
   constexpr std::size_t protected_bytes = 4096;
-  auto budget = std::make_shared<vision::AdmissionBudget>(
-      protected_bytes + (2U << 20), protected_bytes);
+  auto budget = RuntimeBudget(protected_bytes + (2U << 20), protected_bytes);
   fake::budget = budget;
   auto encoder = std::make_shared<vision::Encoder>("unused", kWidth);
   const auto small = Prompt();

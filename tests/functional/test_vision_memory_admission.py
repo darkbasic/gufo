@@ -4,7 +4,9 @@ import unittest
 from unittest.mock import patch
 
 from vision_memory_admission import (cache_startup_evidence, concurrent_progress, mixed_progress,
-                                     populated_cache_evidence, qualification_options, run_mixed_phase)
+                                     populated_cache_evidence, qualification_options, qualify_cache_growth,
+                                     run_mixed_phase,
+                                     startup_stage_evidence)
 
 
 class OnDemandQualification(unittest.TestCase):
@@ -17,7 +19,7 @@ class OnDemandQualification(unittest.TestCase):
     @staticmethod
     def startup():
         return ("schema=vision-admission-v1 event=vision_admission policy=on-demand "
-                "vision_capacity_bytes=1000000000 vision_startup_bytes=0\n"
+                "gate=device_state result=eligible vision_startup_bytes=0\n"
                 "schema=vision-admission-v1 event=vision_cache_grant policy=on-demand "
                 "granted_bytes=4294967296 backing=lazy\n"
                 "schema=component-cache-v1 event=configured capacity_bytes=4294967296 "
@@ -62,7 +64,9 @@ class OnDemandQualification(unittest.TestCase):
 
     def test_unused_pool_and_legacy_policy_cannot_qualify(self):
         for before, after in (("vision_startup_bytes=0", "vision_startup_bytes=4294967296"),
-                              ("policy=on-demand", "policy=request-aware")):
+                              ("policy=on-demand", "policy=request-aware"),
+                              ("gate=device_state", "gate=combined"),
+                              ("result=eligible", "result=refused")):
             with self.subTest(after=after), self.assertRaisesRegex(RuntimeError, "startup did not select"):
                 cache_startup_evidence(self.startup().replace(before, after))
 
@@ -71,6 +75,71 @@ class OnDemandQualification(unittest.TestCase):
                                      "event=configured staging_capacity_bytes=4294967296")
         with self.assertRaisesRegex(RuntimeError, "full configured"):
             cache_startup_evidence(log)
+
+    def test_text_gate_eligibility_is_not_completed_startup(self):
+        log = ("event=vision_admission policy=on-demand result=eligible "
+               "device_admission_bytes=40497639424 state_capacity_bytes=40079626240\n")
+        stages = startup_stage_evidence(log)
+        self.assertEqual(stages["text_gate"][0]["result"], "eligible")
+        self.assertFalse(stages["model_startup_completed"])
+        self.assertFalse(stages["readiness_observed"])
+        self.assertEqual(stages["cache_grants"], [])
+
+    def test_engine_trim_is_retained_even_when_owner_qualification_fails(self):
+        log = self.startup().replace("4294967296", "2147483648") + (
+            "event=ram_cache_trimmed requested_bytes=4294967296 capacity_bytes=2147483648\n"
+            "event=backing_prepared committed_bytes=4096\n"
+            "event=backing_limited reason=host_reserve\n"
+            "event=load_completed speculative=mtp\n")
+        stages = startup_stage_evidence(log, readiness_observed=True)
+        self.assertTrue(stages["model_startup_completed"])
+        self.assertTrue(stages["readiness_observed"])
+        self.assertEqual(stages["cache_grants"][0]["granted_bytes"], "2147483648")
+        self.assertEqual([record["event"] for record in stages["cache_backing"]],
+                         ["ram_cache_trimmed", "backing_prepared", "backing_limited"])
+        with self.assertRaisesRegex(RuntimeError, "owner workload not qualified"):
+            cache_startup_evidence(log)
+
+    def test_failed_attempt_keeps_historical_refusal_without_ready_evidence(self):
+        log = ("event=vision_admission policy=on-demand result=refused "
+               "memory_capacity_bytes=34627985408 total_required_bytes=35358287184 "
+               "deficit_bytes=730301776 refusal_reason=text_state_capacity\n")
+        stages = startup_stage_evidence(log)
+        self.assertEqual(stages["text_gate"][0]["deficit_bytes"], "730301776")
+        self.assertFalse(stages["model_startup_completed"])
+        self.assertFalse(stages["readiness_observed"])
+
+    def test_backing_pressure_on_either_load_fails_owner_qualification(self):
+        for event in ("backing_limited", "ram_cache_trimmed"):
+            for name in ("server.log", "server-restarted.log"):
+                evidence = {}
+                logs = {"server.log": self.startup(), "server-restarted.log": self.startup()}
+                logs[name] += f"event={event} reason=shared_reservation\n"
+                with self.subTest(event=event, log=name), self.assertRaisesRegex(
+                        RuntimeError, "owner workload not qualified"):
+                    qualify_cache_growth(logs, evidence)
+                self.assertEqual(evidence["status"], "not_qualified")
+                self.assertEqual(evidence["pressure_events"][0]["log"], name)
+                self.assertEqual(evidence["pressure_events"][0]["event"], event)
+
+    def test_image_resource_refusal_is_not_cache_growth_pressure(self):
+        evidence = {}
+        logs = {"server.log": self.startup() + (
+            "event=vision_request result=refused reason=capacity\n"
+            "event=request_failed error=resource_exhausted\n"
+            "event=backing_grown committed_bytes=8192\n")}
+        qualify_cache_growth(logs, evidence)
+        self.assertEqual(evidence, {"pressure_events": [], "status": "passed"})
+
+    def test_later_growth_does_not_hide_earlier_backing_limit(self):
+        evidence = {}
+        logs = {"server.log": self.startup() + (
+            "event=backing_limited reason=host_reserve\n"
+            "event=backing_grown committed_bytes=4294967296\n")}
+        with self.assertRaisesRegex(RuntimeError, "backing growth was limited"):
+            qualify_cache_growth(logs, evidence)
+        self.assertEqual(evidence["status"], "not_qualified")
+        self.assertEqual(len(evidence["pressure_events"]), 1)
 
     @staticmethod
     def cache_response(**categories):
