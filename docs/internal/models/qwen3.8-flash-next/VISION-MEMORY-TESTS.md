@@ -1,11 +1,100 @@
 # Vision admission: VM validation
 
-The results below distinguish the current copy-width follow-up from earlier
-iterations in a VM without an inference GPU or model weights. No weights were
-downloaded, no inference host was accessed, and no hardware qualification ran.
+The results below distinguish the current native transfer-resource investigation
+from earlier iterations in a VM without an inference GPU or model weights.
+No weights were downloaded, no inference host was accessed, and no hardware
+qualification ran.
 The [accounting analysis](VISION-MEMORY.md) and
 [owner-run GPU procedure](VISION-MEMORY-VALIDATION.md) describe the remaining
 physical-capacity, performance and numerical checks.
+
+## Native transfer-resource investigation
+
+This follow-up starts from clean HEAD
+`1426e9d787a8c473919edc71afdd3948f25bb439`. The owner-reported r6 run confirms
+that the prior copy-width correction worked and reached four-session readiness;
+it does not qualify the requested cache. The [r6 record](VISION-MEMORY-ADMISSION.md#r6-resource-observations-at-1426e9d7)
+separates the construction interval, grant, planned payload/metadata, ordinary
+backing warmup and remaining runtime capacity.
+
+The [new native probe](../../transfer-resource-probe.md) measures isolated
+creation, first use and cleanup before a production pool change is considered.
+This follow-up does not change the pool size, native resource creation contract,
+text admission, cache semantics or image reservations. The existing production
+transfer pool is compiled against simulated HIP for the CPU regressions.
+New cases exercise four permanently held session-style leases, concurrent
+transfer/completion ownership, exhaustion and recovery, facade lifetime,
+quarantine, and every partial stream/event creation failure for a small pool.
+They complement the existing backing and idle-preservation regressions.
+
+On November 11, 2026, the native CPU build and focused regressions passed
+using the existing configured build and dependency environment documented below:
+
+| Current check | Result |
+| --- | --- |
+| Focused native CTest regressions | 14/14 passed; 23.38 seconds |
+| Probe production phase driver with simulated HIP | Passed; 24 mode/count cases plus CLI/failure paths; CTest 0.02 seconds |
+| Production transfer/backing regression | Passed; CTest 0.01 seconds |
+| Existing disk-publication regression | Passed; CTest 20.02 seconds |
+| Changed C++ formatting | 5 files passed |
+| Target link-graph check | Passed; 10 protected targets |
+
+```sh
+cmake --build --preset cpu-test --parallel 4 --target \
+  hip_resource_probe_test cache_full_backing_test cache_idle_spill_test \
+  cache_slot_test cache_adapter_lifecycle_test component_text_cache_test \
+  qwen_vision_admission_test qwen_vision_lifecycle_test qwen_vision_cache_test \
+  text_model_runner_test cache_disk_publication_test gguf_identity_test \
+  qwen38_flash_next_memory_test qwen38_flash_next_continuation_layout_test
+ctest --preset cpu-test --output-on-failure -R \
+  '^(hip_resource_probe_test|cache_(full_backing|idle_spill|slot|adapter_lifecycle|disk_publication)_test|component_text_cache_test|qwen_vision_(admission|lifecycle|cache)_test|text_model_runner_test|gguf_identity_test|qwen38_flash_next\.(memory|continuation_layout))$'
+clang-format --dry-run --Werror \
+  tests/cache/full_backing_test.cpp tests/diagnostics/hip_resource_probe_test.cpp \
+  tests/diagnostics/fake_hip/hip/hip_runtime.h \
+  tools/diagnostics/hip_resource_probe.cpp tools/diagnostics/hip_resource_probe.hpp
+python3 tools/ci/check-target-graph.py --report build/cpu-test/gufo-link-graph.json
+```
+
+This includes GGUF identity and the existing disk-publication regressions.
+The GGUF identity fix is present and untouched. The deployment's independent
+`b97f3b5cf5f507cbfa86a061b9dd380104e84547` is not an ancestor of this checkout:
+`disk.cpp` still calls `ValidateReferences(false)`, rather than that patch's
+`ValidateCandidate()`. This investigation neither changes disk code nor reapplies
+that separate patch. Retain it in the deployment's composed source stack; the
+publication test above does not establish that the patch is present here.
+
+The probe tests use the same phase
+driver and real transfer-pool implementation as the native tool, with simulated
+HIP failures and small buffers. No full-model or full-CPU sweep was needed for
+this tool-only investigation.
+
+On November 11, 2026, repository checks passed for the extension API
+(0.2.25, 130 surface paths), generated infrastructure, serving isolation
+(zero strict-boundary violations) and documentation (167 Markdown files,
+722 local links). Commands:
+
+```sh
+python3 tools/ci/check-extension-api.py --base 1426e9d787a8c473919edc71afdd3948f25bb439
+python3 tools/ci/generate-infrastructure.py --check
+python3 tools/ci/check-extension-isolation.py --fail-on-serving-boundary
+python3 tools/ci/check-docs.py
+python3 tools/ci/check-format.py
+```
+
+The whole-tree formatting command still reports only untouched baseline lines
+`src/cli/serve/audio_tts_api.cpp:473` and `tests/cli/openai_chat_test.cpp:6633`.
+Those files remain unchanged; this is not a pinned Nix formatting pass.
+
+Real HIP compilation and execution of the new probe remain pending: the VM
+has no suitable ROCm/HIP toolchain or GPU. Earlier owner-run release/container
+builds did not compile this new tool. No production HIP translation unit is
+changed in this investigation; the new native tool and its real-runtime
+production transfer-pool dependency still require the documented GPU SDK build.
+Fake-HIP CPU results establish neither GPU compilation nor physical costs,
+asynchronous hardware behavior, image numerics or complete workload fit.
+
+The following section records the previous copy-width change, not new results
+for this investigation.
 
 ## Copy-width and cache-phase follow-up
 

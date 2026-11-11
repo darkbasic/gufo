@@ -48,13 +48,20 @@ row allocation replaces that pending amount with committed ownership. Trimming
 rows restores their pending obligation before freeing them. The fixed-pool
 mode retains its earlier eager rollback and retained floor.
 
-The [latest owner-reported attempt](VISION-MEMORY-ADMISSION.md#ready-engine-with-cache-limits-at-83c0c7a2)
-reached readiness with four sessions, full context, MTP and vision. It still
-failed the owner's target: the RAM grant was 484,536,320 bytes below 4 GiB and
-backing stopped at 259,522,560 bytes. The earlier combined startup refusal is
-preserved separately in that evidence page. Text eligibility, completed startup,
-cache grant, planned payload/metadata, committed backing and image capacity are
-separate results.
+The [latest owner-reported r6 attempt](VISION-MEMORY-ADMISSION.md#r6-resource-observations-at-1426e9d7)
+confirmed eight-row copy selection and readiness with four sessions, full context,
+MTP and vision. Its RAM grant remained 443,695,104 bytes below 4 GiB. Backing
+committed 2,229,338,112 bytes and stopped at its ordinary warmup target without a
+pressure warning; only 9,113,408 runtime bytes remained in the subsequent
+observation. The configured grant, production payload/metadata plan, actual
+commitment and runtime image capacity are separate qualification results.
+
+The resource-construction phase consumed 512 MiB of HIP free capacity before
+slots or backing. Its 64 stream/event pairs also exist upstream. The
+[independent model-free probe](../../transfer-resource-probe.md) is the next
+measurement; no per-stream cost or footprint saving is established. Do not
+repeat an unchanged full-model load or lower transfer concurrency without a
+lease/progress proof and measured peak-memory benefit.
 
 ## Optional copied-token width
 
@@ -74,12 +81,11 @@ requests, cancellation and retained asynchronous users keep the existing
 execution-commitment and reservation ownership. Affordable wider execution
 remains available without another CLI option.
 
-For the latest recorded inputs, the selector chooses eight rows. Compared with
-64 rows this removes 1,903,942,656 bytes of accepted deferred work and only
-9,175,040 initially committed hidden bytes across four sessions. The latter
-cannot close the independent 484,536,320-byte logical-grant shortfall. These
-are formula differences, not measured physical savings; the next GPU attempt
-must establish grant, backing and remaining image capacity.
+The earlier 64-row observation and r6 eight-row confirmation show that the
+selector correction works. Production formulas differ by 1,903,942,656 deferred
+bytes and 9,175,040 initially committed hidden bytes across four sessions.
+The correction does not establish that the requested cache or images fit;
+r6 still reports the independent grant and runtime constraints above.
 
 Cache-initialization observations bracket resource construction and slot
 allocation. They report host/device capacity, explicit committed bytes,

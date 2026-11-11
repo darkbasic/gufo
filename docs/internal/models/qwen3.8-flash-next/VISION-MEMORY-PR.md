@@ -34,32 +34,33 @@ that has not materialized stays protected. Charges follow ownership until
 buffers and asynchronous users are released. Allocation failures and ordinary
 capacity exhaustion preserve the existing resource-error and recovery paths.
 
-The latest owner-run candidate reached readiness with four full-context
-sessions, seven-token MTP and vision. The launcher correctly rejected its
-3,810,430,976-byte RAM grant; physical backing separately stopped at
-259,522,560 bytes. Automatic 64-row copied-token verification had passed the
-text gate while adding optional work to the runtime budget.
+The latest owner-run r6 candidate confirms on-demand admission, ordinary
+eight-row copied-token verification, four full-context sessions, seven-token
+MTP and vision. The engine reached readiness; the launcher correctly rejected
+its 3,851,272,192-byte RAM grant. Backing crossed the ordinary 2 GiB preparation
+target at 2,229,338,112 bytes, while the later runtime observation had only
+9,113,408 bytes of headroom. These are distinct results, not complete workload
+qualification.
 
-Make that width choice pressure-aware: wider rows require device eligibility
-and host/device headroom for the configured cache preference plus existing
-runtime margin. Failure to fund wider acceleration selects ordinary eight-row
-verification, never a new combined startup refusal. Neural MTP's draft limit
-and every deployment setting remain unchanged. The chosen width bounds actual
-allocation and pending accounting together.
+The optional-width correction remains: wider rows require device eligibility
+and host/device headroom for the cache preference plus existing runtime margin.
+Failure selects ordinary verification, never a combined startup refusal or a
+change to neural MTP's draft limit. The selected bound controls allocation and
+pending accounting together.
 
-At the recorded inputs, 64→8 removes 1,903,942,656 deferred bytes and 9,175,040
-initially committed hidden bytes across four sessions. Narrowing alone cannot
-close the independent 484,536,320-byte cache-grant gap. Add phase observations
-around cache-resource construction and slot allocation, with actual backing
-plan/commitment fields, to localize the remaining unattributed interval. Keep
-the upstream 64 transfer stream/event pairs; no byte cost or queue equivalence
-is assumed. Independent allocator/transfer optimizations stay outside this PR.
-See the [accounting comparison](VISION-MEMORY.md) and
+The new phase observations localize 512 MiB of HIP consumption to cache-resource
+construction before slots/backing. This phase creates the upstream 64 native
+stream/event pairs, but does not establish their individual cost or a safe pool
+reduction. A separately reviewable [model-free native probe](../../transfer-resource-probe.md)
+now investigates that overhead. No allocator/transfer optimization or claimed
+memory saving belongs to this #920 correction without that evidence and a
+lease/progress proof. See the [accounting comparison](VISION-MEMORY.md) and
 [recorded evidence](VISION-MEMORY-ADMISSION.md).
 
 CPU regressions use production admission, resource hooks and ownership with
-synthetic observations and small allocations. They execute the production width-selection path for constrained and affordable
-wide plans, distinguish startup stages,
+synthetic observations and small allocations. They execute the production
+width-selection path for constrained and affordable wide plans, distinguish
+startup stages,
 retain concurrency/history/replacement/failure coverage and preserve strict
 mixed-workload qualification. The harness records text eligibility, completed
 startup/readiness and cache grant/backing separately, including failed
@@ -68,10 +69,15 @@ full-budget qualification while retaining functional results. See
 [validation results](VISION-MEMORY-TESTS.md) for actual
 commands and outcomes.
 
-The real HIP release build, GPU numerical correctness and physical workload
-fit remain pending. The [owner procedure](VISION-MEMORY-VALIDATION.md) makes one
-candidate attempt after production chat is unloaded, retaining auxiliary
-services, unchanged settings, a separate port and disposable disk-backed cache.
-It stops on startup refusal and preserves that log. The independent GGUF
-identity and disk-publication fixes remain intact; no launcher changes,
+The new probe's real HIP compilation and execution, GPU numerical correctness
+and complete physical workload fit remain pending. No production HIP source is
+changed by this measurement follow-up; CPU tests compile the existing transfer
+pool against simulated HIP only. The [owner procedure](VISION-MEMORY-VALIDATION.md) runs the
+model-free probe first with production chat unloaded. Another full-model attempt
+requires a justified changed candidate or a specific unresolved measurement;
+it retains auxiliary services, unchanged settings, a separate port and disposable
+disk-backed cache, and stops on admission/cache refusal while preserving the log.
+The independent GGUF identity fix remains untouched. Keep the deployment's
+separate disk-publication fix in its composed source stack; it is absent from
+this checkout and this investigation does not reapply it. No launcher changes,
 weights, inference-host access, commits or pushes are part of this correction.

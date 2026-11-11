@@ -1,9 +1,109 @@
 # Vision admission: recorded ZBook evidence
 
-This page preserves owner-reported hardware observations as of November 10,
-2026. The latest candidate reached readiness with four sessions; its cache
-limits still failed the deployment target. The VM did not execute these runs.
+This page preserves owner-reported hardware observations as of November 11,
+2026. The latest candidate reached readiness with four sessions and ordinary
+copy verification; its cache grant still failed the deployment target. The VM
+did not execute these runs.
 See the [current policy](VISION-MEMORY.md) and [validation scope](VISION-MEMORY-TESTS.md).
+
+## r6 resource observations at 1426e9d7
+
+The owner-run r6 build used `1426e9d787a8c473919edc71afdd3948f25bb439` and
+confirmed on-demand vision, `copy_width_selection rows=8`, four sessions at
+context 262,144 and MTP `draft_limit=7`. Native `load_completed` and
+`/v1/models` succeeded. The launcher correctly rejected the effective RAM grant;
+its requested-session/cache check remains unchanged.
+
+The observations bracket adapter/resource construction before backing pages
+exist:
+
+| Observation | Before resources | After resources |
+| --- | ---: | ---: |
+| HIP free bytes | 40,489,259,008 | 39,952,388,096 |
+| Host available bytes | 38,881,210,368 | 38,341,914,624 |
+| Explicit execution committed bytes | 0 | 0 |
+| Transfer stream count | 0 | 64 |
+
+The interval consumes **536,870,912 HIP bytes (512 MiB)** and
+**539,295,744 host bytes (514.3125 MiB)**. Production construction creates the
+adapter/component metadata and 64 native stream/event pairs; cache-page
+commitment occurs later. This localizes a substantial cost to that phase, but
+does not prove a per-stream cost, a hardware-queue count or proportional savings
+from reducing the pool. The same eager transfer construction exists upstream
+in Gufo 0.33.0. The [independent native probe](../../transfer-resource-probe.md)
+separates runtime warmup, stream creation, event creation and first use before
+any optimization is chosen.
+
+Slot and grant observations were:
+
+```text
+pre_slots:
+  hip_free_bytes=39952388096
+  host_available_bytes=38000246784
+post_slots:
+  hip_free_bytes=10214772736
+  host_available_bytes=8147288064
+  execution_committed_bytes=29492622480
+  execution_pending_bytes=1033826496
+  runtime_capacity_bytes=2281623360
+per_slot:
+  hip_free_decrease_bytes=7434403840
+  execution_committed_increase_bytes=7373155620
+cache_grant:
+  host_available_bytes=8147288064
+  host_reserve_bytes=4294967296
+  staging_capacity_bytes=1048576
+  requested_bytes=4294967296
+  granted_bytes=3851272192
+```
+
+The grant is **443,695,104 bytes (423.140625 MiB)** below 4 GiB. Between resource
+construction and `pre_slots`, host availability decreases another 341,667,840
+bytes while HIP free is unchanged. Each slot's HIP decrease exceeds its explicit
+execution increase by 61,248,220 bytes. Those interval differences remain
+unattributed; they are not established allocator rounding, leaks or transfer
+storage. Keep them separate from the measured resource-construction interval.
+
+Backing reached its ordinary preparation target:
+
+```text
+backing_prepared:
+  committed_bytes=2229338112
+  segment_bytes=131137536
+  segments=17
+  planned_payload_bytes=3409051648
+  planned_metadata_bytes=53270528
+post_backing:
+  host_available_bytes=5874778112
+  execution_pending_bytes=1033826496
+  dynamic_committed_bytes=2229338112
+  pending_bytes=0
+  runtime_capacity_bytes=9113408
+```
+
+Seventeen segments commit 2,229,338,112 bytes, crossing the ordinary 2 GiB
+warmup target. No `backing_limited` warning is expected when warmup stops there;
+its absence does not prove another segment or the complete payload fits.
+The current grant's plan still has **1,179,713,536 uncommitted payload bytes**.
+The next 131,137,536-byte segment exceeds the reported 9,113,408-byte runtime
+capacity by 122,024,128 bytes, holding that observation fixed. Funding even the
+current plan's remaining payload would require 1,170,600,128 additional bytes
+of headroom under the same observation, before any images. These differences
+are snapshot arithmetic, not new allocation measurements.
+
+Post-backing accounting is consistent with the existing reserves:
+
+```text
+5874778112 - 4294967296 - 536870912 - 1033826496 = 9113408
+```
+
+Committed backing already lowered host availability and is not subtracted
+again. Recovering the 423.140625 MiB grant gap would not establish full backing
+or image capacity: a full requested grant has its own larger production plan.
+Keep retention grant, planned payload/metadata, actual commitment and remaining
+runtime headroom as separate qualification results. No model reload is warranted
+until the model-free probe supports a specific changed candidate or resolves a
+necessary measurement.
 
 ## Ready engine with cache limits at 83c0c7a2
 

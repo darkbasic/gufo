@@ -22,6 +22,7 @@ set(gufo_pr_targets
   http_request_test multipart_test
   heap_placement_test
   admission_memory_test
+  hip_resource_probe_test
   qwen_vision_admission_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test platform_library_test

@@ -1,10 +1,13 @@
 # Vision memory admission: owner-run GPU validation
 
 Run this procedure on the ZBook's actual gfx1151 GPU after building the
-candidate. The owner-reported `83c0c7a2` reached four-session readiness but
-failed the cache target. **The revised candidate, complete workload capacity,
-performance and numerical image correctness remain unqualified.** CPU accounting
-and simulated allocations do not establish GPU compilation or physical fit.
+candidate. The owner-reported r6 build at `1426e9d7` confirmed the copy-width
+correction and four-session readiness but failed the requested cache grant.
+**Complete workload capacity, performance and numerical image correctness remain
+unqualified.** The next owner action is the [model-free transfer-resource
+probe](../../transfer-resource-probe.md), not another unchanged model load.
+CPU accounting and simulated allocations do not establish GPU compilation or
+physical fit.
 
 The harness owns a separate loopback port and disposable cache. It never
 downloads weights, changes kernel parameters, clears production caches or stops
@@ -32,11 +35,25 @@ The harness cannot arrange this window or identify the deployment's services.
 Its cleanup terminates only its own candidate child. If a maintenance window
 is unavailable, leave execution pending; building needs no model load.
 
+## Preconditions for another model attempt
+
+First collect the native probe's creation/use/destruction evidence with
+production chat unloaded. A production change needs a defensible footprint
+benefit and the lease/forward-progress checks in that procedure. Moving an
+inevitable allocation past readiness does not qualify as a saving. Keep any
+independent transfer-resource change separately reviewable from #920; the local
+candidate can compose both after review.
+
+The remaining full-model procedure applies only after a changed candidate has
+that justified expectation, or the owner names a specific unresolved measurement
+that needs models. The r6 gate/cache observations already exist. Do not request
+another unchanged reboot/load to reproduce them.
+
 ## Build and record inputs
 
-The real HIP release build of this corrective change remains pending in the
-development VM, which has no suitable ROCm/HIP toolchain. Prior candidate
-HIP/container results do not compile this diff. On a capable environment:
+A future production candidate needs a real HIP release build. The development
+VM has no suitable ROCm/HIP toolchain; its CPU checks do not compile that path.
+On a capable environment:
 
 ```sh
 cmake --preset release
@@ -81,7 +98,8 @@ DRM usage files are unavailable, avoiding a repeat solely for missing peaks.
 
 ## One targeted full-workload attempt
 
-Run the following once from the source checkout after the maintenance steps.
+Only after the prerequisites above are satisfied, run the following once from
+the source checkout after the maintenance steps.
 Port 18092 must be unused. The harness creates `run/disposable-cache`, performs
 the workload in one owned server, and restarts that server once only if needed
 to verify disk restoration after successful first-phase checks. It does not
@@ -100,8 +118,8 @@ python3 tests/functional/vision_memory_admission.py \
   --think auto --reasoning-effort xhigh --preserve-thinking on
 ```
 
-This changed candidate tests one concrete correction and one unresolved interval;
-do not repeat the preceding build unchanged. Retain these observations:
+Record the production change and the precise memory hypothesis before starting.
+Do not repeat r6 unchanged. Retain these observations:
 
 - `copy_width_selection` reports selected rows and `reason`. The latest recorded
   capacities select `rows=8 reason=ordinary_fallback`; wider rows are valid if
@@ -125,11 +143,11 @@ do not repeat the preceding build unchanged. Retain these observations:
   with exactly 4 GiB: the configured retention budget includes metadata and
   headroom. Preserve later growth and refusal observations separately.
 
-The [latest evidence](VISION-MEMORY-ADMISSION.md#ready-engine-with-cache-limits-at-83c0c7a2)
-had a 484,536,320-byte grant gap and only 259,522,560 committed backing bytes.
-Narrowing copy verification removes mostly unmaterialized work and cannot be
-assumed to close the grant gap. Do not substitute an earlier vision-preparation
-or later cleanup reading for a cache phase.
+The [latest r6 evidence](VISION-MEMORY-ADMISSION.md#r6-resource-observations-at-1426e9d7)
+has a 443,695,104-byte grant gap despite successful eight-row selection.
+Backing reached its ordinary 2 GiB warmup target; the lack of a warning does not
+prove that the remaining payload or images fit. Do not substitute an earlier
+vision-preparation or later cleanup reading for a cache phase.
 
 Read the attempt in four stages: text-state eligibility, completed model
 startup/readiness, effective cache grant and backing, then image admission and
@@ -222,9 +240,11 @@ or service changes are part of this procedure.
 ## Policy compatibility
 
 The existing workstation recipe already forwards `--vision-memory-policy
-on-demand`. Add the corrective source revision after `83c0c7a2623e6af3a892cd7b031032ed7e30228a`
-to that recipe's candidate source selection when the patch is reviewed and
-committed; do not reapply earlier fixes or change its workload options. Record
+on-demand`. Keep the source stack through
+`1426e9d787a8c473919edc71afdd3948f25bb439`. Add a separately reviewed
+cache-resource revision only if the probe supports that implementation; do not
+reapply earlier fixes or change workload options. Building/running the probe
+does not itself justify another full-model recipe revision. Record
 the resulting revision/build provenance. This VM patch does not edit the kit or
 invent launcher commands. Keep any existing launcher check for four sessions
 and a full 4 GiB effective cache: engine readiness alone does not satisfy it.

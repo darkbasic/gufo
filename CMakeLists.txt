@@ -498,6 +498,22 @@ if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
   target_include_directories(gufo_kernel_bench_support PUBLIC ${CMAKE_SOURCE_DIR})
 endif()
 
+if (ENGINE_ENABLE_HIP)
+  # Runtime-only resource measurements, including the actual cache pool. This
+  # target needs no model or device-kernel object files; build it in the same
+  # SDK environment and run it with the deployment's existing HIP runtime.
+  # An explicit release target avoids the unrelated profiling prerequisites of
+  # GUFO_BUILD_TOOLS, without adding a tool to the ordinary release package.
+  add_executable(gufo-hip-resource-probe EXCLUDE_FROM_ALL
+    tools/diagnostics/hip_resource_probe.cpp
+    src/core/hip/transfer_pool.cpp)
+  target_link_libraries(gufo-hip-resource-probe PRIVATE
+    gufo_cache gufo_ext_runtime gufo_hip_host hip::host)
+  if (GUFO_BUILD_TOOLS)
+    set_property(TARGET gufo-hip-resource-probe PROPERTY EXCLUDE_FROM_ALL FALSE)
+  endif()
+endif()
+
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   # TheRock for Windows ships no roctx; skip only gufo-kernel-bench there so
   # the other tools (e.g. qwen27b_verify_sweep) still build.
@@ -547,7 +563,7 @@ else()
   install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E copy \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo.exe\" \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server.exe\")")
 endif()
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
-  install(TARGETS tune_hipblaslt DESTINATION bin)
+  install(TARGETS tune_hipblaslt gufo-hip-resource-probe DESTINATION bin)
   if (TARGET gufo-kernel-bench)
     install(TARGETS gufo-kernel-bench DESTINATION bin)
   endif()
@@ -1250,6 +1266,19 @@ endfunction()
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
   add_test(NAME gpu_queues_test COMMAND gpu_queues_test)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
+
+  add_executable(hip_resource_probe_test
+    tests/diagnostics/hip_resource_probe_test.cpp
+    tools/diagnostics/hip_resource_probe.cpp
+    src/core/hip/transfer_pool.cpp)
+  target_compile_definitions(hip_resource_probe_test PRIVATE
+    GUFO_HIP_RESOURCE_PROBE_TEST)
+  target_include_directories(hip_resource_probe_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/fake_hip)
+  target_link_libraries(hip_resource_probe_test PRIVATE gufo_cache)
+  add_test(NAME hip_resource_probe_test COMMAND hip_resource_probe_test)
+  set_tests_properties(hip_resource_probe_test PROPERTIES
+    LABELS "cpu;diagnostics;hip-contract" TIMEOUT 30)
 
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")

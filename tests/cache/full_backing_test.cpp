@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <cassert>
@@ -16,6 +17,7 @@
 
 #include "src/core/hip/committed_backing.hpp"
 #include "src/core/hip/component_cache_resources.hpp"
+#include "src/core/hip/transfer_pool.hpp"
 #include "src/core/resource_error.hpp"
 #include "src/families/qwen/vision/admission.hpp"
 #include "src/models/qwen38_flash_next/cache_admission.hpp"
@@ -26,6 +28,9 @@ std::map<void*, std::size_t> registered;
 std::atomic<std::size_t> registered_bytes{};
 std::function<void()> verify_segment_ownership;
 bool fail_registration{}, fail_query{};
+std::atomic<unsigned> native_creations{}, live_streams{}, live_events{};
+int fail_native_creation{-1};
+bool fail_event_record{};
 constexpr std::size_t kPayloadBytes = 4 * 4096;
 constexpr std::size_t kMetadataBytes = 16384;
 constexpr std::size_t kBudgetBytes = 1 << 20;
@@ -352,6 +357,133 @@ void SegmentTicketFailureAndLifetime(int failure) {
   fail_registration = false;
 }
 
+void TransferConstructionFailures() {
+  using gufo::hip::TransferPool;
+  assert(!live_streams && !live_events);
+  // Fail each stream/event creation, including failures after complete pairs
+  // and after a stream whose matching event could not be created.
+  for (int failure = 0; failure < 10; ++failure) {
+    native_creations = 0;
+    fail_native_creation = failure;
+    bool refused = false;
+    try {
+      TransferPool pool(5);
+    } catch (const std::runtime_error&) {
+      refused = true;
+    }
+    assert(refused && native_creations == unsigned(failure + 1));
+    assert(!live_streams && !live_events);
+  }
+  fail_native_creation = -1;
+}
+
+void TransferPreservationOwnership() {
+  using namespace gufo;
+  // A small synthetic pool exercises ownership, not a proposed production
+  // minimum. Four session preservation leases remain held throughout three
+  // concurrent transfers, as they do during serving capture/restore work.
+  native_creations = 0;
+  auto pool = std::make_unique<hip::TransferPool>(7);
+  assert(native_creations == 14 && live_streams == 7 && live_events == 7);
+  std::array<std::unique_ptr<hip::TransferStream>, 4> preservation;
+  for (auto& stream : preservation) {
+    stream = pool->TryAcquire();
+    assert(stream);
+  }
+  std::barrier acquired(4), streams_released(4);
+  std::latch release_streams(1), release_completions(1);
+  std::array<std::thread, 3> workers;
+  for (auto& worker : workers) {
+    worker = std::thread([&] {
+      auto stream = pool->TryAcquire();
+      assert(stream);
+      std::array<std::byte, 16> source{}, destination{};
+      source.front() = std::byte{42};
+      auto completion =
+          stream->Copy(destination.data(), source.data(), source.size(),
+                       hip::CopyDirection::kDeviceToHost, 4);
+      acquired.arrive_and_wait();
+      release_streams.wait();
+      assert(completion.Wait() == cache::TransferResult::kSucceeded);
+      assert(destination == source);
+      stream.reset();
+      streams_released.arrive_and_wait();
+      release_completions.wait();
+    });
+  }
+  acquired.arrive_and_wait();
+  assert(!pool->TryAcquire());
+  release_streams.count_down();
+  streams_released.arrive_and_wait();
+  // Synchronizing and releasing the stream do not release a pair while its
+  // completion still owns it. No hidden native creation may cover exhaustion.
+  assert(!pool->TryAcquire() && native_creations == 14);
+  release_completions.count_down();
+  for (auto& worker : workers)
+    worker.join();
+  {
+    std::array<std::unique_ptr<hip::TransferStream>, 3> reused;
+    for (auto& stream : reused) {
+      stream = pool->TryAcquire();
+      assert(stream);
+    }
+    assert(!pool->TryAcquire() && native_creations == 14);
+  }
+  pool.reset();
+  assert(live_streams == 7 && live_events == 7);
+  for (auto& stream : preservation)
+    stream.reset();
+  assert(!live_streams && !live_events && native_creations == 14);
+}
+
+void TransferQuarantine() {
+  using namespace gufo;
+  native_creations = 0;
+  hip::TransferPool pool(5);
+  std::array<std::unique_ptr<hip::TransferStream>, 4> preservation;
+  for (auto& stream : preservation)
+    stream = pool.TryAcquire();
+  auto transfer = pool.TryAcquire();
+  assert(transfer && !pool.TryAcquire());
+  fail_event_record = true;
+  bool failed = false;
+  try {
+    (void)transfer->Complete();
+  } catch (const std::runtime_error&) {
+    failed = true;
+  }
+  fail_event_record = false;
+  assert(failed);
+  transfer.reset();
+  // A failed pair cannot be reused or silently replaced by a native allocation.
+  assert(!pool.TryAcquire() && native_creations == 10);
+  preservation.front().reset();
+  transfer = pool.TryAcquire();
+  assert(transfer);
+  auto completion = transfer->Complete();
+  assert(completion.Wait() == cache::TransferResult::kSucceeded);
+  assert(native_creations == 10);
+}
+
+void TransferCompletionOwnership() {
+  using namespace gufo;
+  native_creations = 0;
+  std::optional<cache::Completion> completion;
+  {
+    hip::TransferPool pool(1);
+    auto transfer = pool.TryAcquire();
+    assert(transfer);
+    completion.emplace(transfer->Complete());
+  }
+  // Even without the facade or stream, the completion owns the native pair.
+  // Synchronous stubs establish lifetime only, not device execution behavior.
+  assert(live_streams == 1 && live_events == 1 && native_creations == 2);
+  assert(completion->Wait() == cache::TransferResult::kSucceeded);
+  assert(live_streams == 1 && live_events == 1);
+  completion.reset();
+  assert(!live_streams && !live_events && native_creations == 2);
+}
+
 }  // namespace
 
 hipError_t hipHostMalloc(void** pointer, std::size_t bytes, unsigned) {
@@ -383,24 +515,34 @@ hipError_t hipMemGetInfo(std::size_t* free, std::size_t* total) {
   return fail_query ? hipErrorOutOfMemory : hipSuccess;
 }
 hipError_t hipStreamCreateWithFlags(hipStream_t* stream, unsigned) {
+  if (int(native_creations.fetch_add(1)) == fail_native_creation)
+    return hipErrorOutOfMemory;
   *stream = new unsigned{};
+  ++live_streams;
   return hipSuccess;
 }
 hipError_t hipStreamDestroy(hipStream_t stream) {
   delete static_cast<unsigned*>(stream);
+  assert(live_streams.fetch_sub(1));
   return hipSuccess;
 }
 hipError_t hipStreamSynchronize(hipStream_t) {
   return hipSuccess;
 }
-hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned flags) {
-  return hipStreamCreateWithFlags(event, flags);
+hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned) {
+  if (int(native_creations.fetch_add(1)) == fail_native_creation)
+    return hipErrorOutOfMemory;
+  *event = new unsigned{};
+  ++live_events;
+  return hipSuccess;
 }
 hipError_t hipEventDestroy(hipEvent_t event) {
-  return hipStreamDestroy(event);
+  delete static_cast<unsigned*>(event);
+  assert(live_events.fetch_sub(1));
+  return hipSuccess;
 }
 hipError_t hipEventRecord(hipEvent_t, hipStream_t) {
-  return hipSuccess;
+  return fail_event_record ? hipErrorOutOfMemory : hipSuccess;
 }
 hipError_t hipEventQuery(hipEvent_t) {
   return hipSuccess;
@@ -431,4 +573,9 @@ int main() {
   CachePolicyCompatibility();
   for (int failure = 0; failure <= 6; ++failure)
     SegmentTicketFailureAndLifetime(failure);
+  TransferConstructionFailures();
+  TransferPreservationOwnership();
+  TransferQuarantine();
+  TransferCompletionOwnership();
+  assert(!live_streams && !live_events);
 }
