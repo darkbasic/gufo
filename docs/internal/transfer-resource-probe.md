@@ -2,15 +2,16 @@
 
 Measure native stream/event overhead without loading a model. This tool is a
 separately reviewable cache-resource investigation, not a change to #920's
-admission policy or the production transfer-pool size. As of November 11, 2026,
-real HIP compilation and execution of this new tool, and any memory saving,
-remain pending. Earlier candidate GPU builds do not compile the new probe.
+admission policy. As of November 11, 2026, the owner has completed all 24 cases
+against the matching runtime. The [native results and qualification limits](cache-transfer-resources.md)
+are recorded separately; the development VM did not execute HIP. This page
+retains the reproducible measurement procedure.
 
 ## Why this measurement is needed
 
 The [owner's r6 observations](models/qwen3.8-flash-next/VISION-MEMORY-ADMISSION.md#r6-resource-observations-at-1426e9d7)
 localize 512 MiB of HIP consumption to cache-resource construction. The
-production path explains the phase:
+production path at the measured revision explains the phase:
 
 - `qwen38_flash_next/continuation_adapter.cpp` builds host layout, identity and
   descriptors; its constructor does not call HIP.
@@ -18,13 +19,15 @@ production path explains the phase:
   `TransferPool` with 64 pairs. Its later `commit_backing` callback creates the
   backing pool and prepares pages, after slot creation and the cache grant.
 - `core/hip/transfer_pool.cpp` creates one nonblocking stream and one
-  timing-disabled event per pair. This implementation is identical to upstream
-  Gufo 0.33.0 at `77dff828be02a498e9951694f31b024e7ac87119`.
+  timing-disabled event per pair. At `62098131`, that implementation was
+  identical to upstream Gufo 0.33.0 at
+  `77dff828be02a498e9951694f31b024e7ac87119`.
 
 This establishes the allocation phase, not a cost per stream or a correspondence
 between streams and hardware queues. The probe separates fixed initialization,
-count-dependent creation and first-use costs before a production change is
-selected. No measured savings are claimed from the CPU simulation.
+count-dependent creation and first-use costs. The resulting
+[Flash-Next resource optimization](cache-transfer-resources.md) is separately
+reviewable; no measured savings are claimed from the CPU simulation.
 
 ## Build outside the production runtime image
 
@@ -130,7 +133,11 @@ This is 24 fresh, sequential processes with at most 64 stream/event pairs
 Each uses only a small device buffer and pinned host buffer, 262,144 bytes each;
 native runtime overhead is the quantity being measured. The `streams` and
 `events` modes isolate creation; `pairs` records stream and event creation
-separately in the same process; `pool` exercises production `TransferPool`.
+separately in the same process; `pool` exercises production `TransferPool`'s
+legacy exclusive constructor. It does not select the changed Flash-Next plan
+with more logical events than native streams or its system-release event flags.
+The owner-provided measurements therefore predict the stream-count saving;
+they do not validate the changed shared-mode path's complete footprint.
 The tool records ordinary HIP initialization, allocation and default-stream
 warmup before measured creation, then first use, synchronization and destruction.
 Milestones at 1, 2, 4, 8, 16 and 64 record the first and subsequent creations

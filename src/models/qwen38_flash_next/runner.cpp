@@ -598,6 +598,18 @@ public:
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
+    return CreateCacheResources(ledger, ram, {});
+  }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(
+      cache::ResourceLedger& ledger, std::size_t ram,
+      std::size_t sessions) const override {
+    return CreateCacheResources(ledger, ram,
+                                hip::PlanComponentTransfers(sessions));
+  }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources> CreateCacheResources(
+      cache::ResourceLedger& ledger, std::size_t ram,
+      std::optional<hip::ComponentTransferPlan> transfers) const {
     ValidateVisionCacheGrant(vision_budget_, required_cache_bytes_, ram);
     if (vision_budget_)
       vision_budget_->ClaimExecutionOwner();
@@ -611,6 +623,10 @@ public:
                      : 0;
           return ceiling > protected_bytes ? ceiling - protected_bytes : 0;
         });
+    if (transfers) {
+      hooks.transfer_streams = transfers->native_streams;
+      hooks.transfer_leases = transfers->leases;
+    }
     if (vision_budget_) {
       hooks.info = [](std::string_view message) {
         server::Logger::Info("cache", std::string(message));

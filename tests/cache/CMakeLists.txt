@@ -20,8 +20,8 @@ if (ENGINE_ENABLE_HIP)
 endif()
 target_link_libraries(gufo_cache_fake PUBLIC gufo_cache)
 
-# Compile production host-side HIP backing logic against synchronous CPU
-# registration/stream stubs. No HIP SDK, device or large allocations are used.
+# Compile production host-side HIP backing logic against CPU registration and
+# queued stream/event stubs. No HIP SDK, device or large allocations are used.
 add_executable(cache_full_backing_test full_backing_test.cpp
   ${PROJECT_SOURCE_DIR}/src/core/hip/component_cache_resources.cpp
   ${PROJECT_SOURCE_DIR}/src/core/hip/committed_backing.cpp

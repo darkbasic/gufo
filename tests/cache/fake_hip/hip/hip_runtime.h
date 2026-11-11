@@ -20,6 +20,7 @@ inline constexpr unsigned hipHostMallocCoherent = 1;
 inline constexpr unsigned hipHostRegisterDefault = 0;
 inline constexpr unsigned hipStreamNonBlocking = 0;
 inline constexpr unsigned hipEventDisableTiming = 0;
+inline constexpr unsigned hipEventReleaseToSystem = 0x80000000;
 
 hipError_t hipHostMalloc(void**, std::size_t, unsigned);
 hipError_t hipHostFree(void*);
