@@ -177,6 +177,12 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
     hooks.info(
         "schema=component-cache-v1 event=backing_prepared committed_bytes=" +
         std::to_string(backing->pool->CommittedBytes()) +
+        " granted_bytes=" + std::to_string(budget) +
+        " planned_payload_bytes=" + std::to_string(payload_bytes) +
+        " planned_metadata_bytes=" + std::to_string(allocation.metadata_bytes) +
+        " block_bytes=" + std::to_string(allocation.block_bytes) +
+        " blocks=" + std::to_string(allocation.blocks) +
+        " segment_bytes=" + std::to_string(segment) +
         (hooks.require_full_backing
              ? " required_payload_bytes=" + std::to_string(payload_bytes)
              : "") +

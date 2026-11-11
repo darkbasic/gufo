@@ -289,6 +289,8 @@ struct ComponentTextCache::Impl {
       disk = std::make_unique<cache::DiskStore>(ledger, options->directory,
                                                 options->capacity_bytes);
     }
+    if (resources->observe_initialization)
+      resources->observe_initialization("pre_slots", 0);
     for (std::size_t i = 0; i < count; ++i) {
       auto entry = std::make_unique<Entry>();
       entry->preservation = Stream();
@@ -304,7 +306,11 @@ struct ComponentTextCache::Impl {
                                  },
                                  resources->reassignment_batch_size});
       entries.push_back(std::move(entry));
+      if (resources->observe_initialization)
+        resources->observe_initialization("post_slot", entries.size());
     }
+    if (resources->observe_initialization)
+      resources->observe_initialization("post_slots", entries.size());
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     // RAM cache limit for a runner that pins its slots; computed before the
     // branch below so a short host refuses the load before anything commits.

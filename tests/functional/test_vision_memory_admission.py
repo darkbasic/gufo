@@ -100,6 +100,42 @@ class OnDemandQualification(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "owner workload not qualified"):
             cache_startup_evidence(log)
 
+    def test_optional_copy_width_does_not_establish_cache_or_image_capacity(self):
+        log = ("event=copy_width_selection policy=on-demand rows=8 "
+               "reason=ordinary_fallback runtime_capacity_bytes=34588672000\n"
+               "event=vision_admission policy=on-demand gate=device_state result=eligible\n")
+        stages = startup_stage_evidence(log)
+        self.assertEqual(stages["copy_width"][0]["rows"], "8")
+        self.assertEqual(stages["copy_width"][0]["reason"], "ordinary_fallback")
+        self.assertEqual(stages["cache_grants"], [])
+        self.assertFalse(stages["readiness_observed"])
+
+    def test_cache_phase_and_planned_backing_remain_separate_from_grant(self):
+        # This tests evidence parsing only; production BackingPlan has native
+        # regressions. Small synthetic fields are not hardware measurements.
+        log = self.startup().replace("granted_bytes=4294967296", "granted_bytes=20") + (
+            "event=cache_initialization phase=pre_cache_resources transfer_stream_count=64 "
+            "host_available_bytes=100 hip_free_bytes=120\n"
+            "event=cache_initialization phase=post_cache_resources transfer_stream_count=64 "
+            "execution_pending_bytes=60\n"
+            "event=cache_initialization phase=post_slots transfer_stream_count=64 "
+            "execution_pending_bytes=10\n"
+            "event=backing_prepared granted_bytes=20 planned_payload_bytes=16 "
+            "planned_metadata_bytes=4 committed_bytes=8\n"
+            "event=backing_limited segment_bytes=8 pending_bytes=0 "
+            "capacity_bytes=3 execution_pending_bytes=10\n")
+        stages = startup_stage_evidence(log, readiness_observed=True)
+        self.assertEqual([row["phase"] for row in stages["cache_phases"]],
+                         ["pre_cache_resources", "post_cache_resources", "post_slots"])
+        self.assertEqual(stages["cache_grants"][0]["granted_bytes"], "20")
+        prepared = stages["cache_backing"][0]
+        self.assertEqual(prepared["planned_payload_bytes"], "16")
+        self.assertEqual(prepared["committed_bytes"], "8")
+        self.assertNotEqual(prepared["planned_payload_bytes"], prepared["granted_bytes"])
+        self.assertEqual(stages["cache_backing"][1]["capacity_bytes"], "3")
+        with self.assertRaisesRegex(RuntimeError, "not 4 GiB"):
+            cache_startup_evidence(log)
+
     def test_failed_attempt_keeps_historical_refusal_without_ready_evidence(self):
         log = ("event=vision_admission policy=on-demand result=refused "
                "memory_capacity_bytes=34627985408 total_required_bytes=35358287184 "

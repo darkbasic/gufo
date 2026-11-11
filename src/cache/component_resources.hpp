@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string_view>
 
 #include "src/cache/adapter.hpp"
 #include "src/cache/checkpoint.hpp"
@@ -49,5 +50,12 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
+  // Optional initialization diagnostics, called before slot creation, after
+  // each completed slot, and after all slots but before the cache recheck.
+  // Phases are pre_slots, post_slot and post_slots; the count is completed
+  // slots. Must not throw or change admission decisions/execution storage.
+  // Empty preserves
+  // existing providers without extra observations.
+  std::function<void(std::string_view, std::size_t)> observe_initialization;
 };
 }  // namespace gufo::cache

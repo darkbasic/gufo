@@ -2105,6 +2105,73 @@ void StagingIsInternal() {
   }
   std::filesystem::remove_all(directory);
 }
+void InitializationObservationsBracketSlots() {
+  struct ObservedAdapter final : FakeAdapter {
+    std::size_t& completed;
+    std::size_t fail_at;
+    ObservedAdapter(std::size_t& completed, std::size_t fail_at)
+        : completed(completed), fail_at(fail_at) {}
+    std::unique_ptr<cache::Slot> CreateSlot(
+        cache::MutationGuard& guard) override {
+      if (completed == fail_at)
+        throw std::bad_alloc();
+      auto slot = FakeAdapter::CreateSlot(guard);
+      ++completed;
+      return slot;
+    }
+  };
+  struct ObservedRunner final : Runner {
+    mutable std::size_t completed{};
+    std::size_t fail_at{4};
+    mutable std::vector<std::pair<std::string, std::size_t>> observations;
+    TextRunnerResourceClaim ResourceClaim() const override {
+      assert(completed == 4);
+      assert((observations.back() ==
+              std::pair<std::string, std::size_t>{"post_slots", 4}));
+      observations.emplace_back("cache_recheck", completed);
+      return Runner::ResourceClaim();
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t) const override {
+      auto owned = std::make_unique<ObservedAdapter>(completed, fail_at);
+      adapter = owned.get();
+      auto resources =
+          server::testing::MakeFakeCacheResources(ledger, std::move(owned));
+      resources->observe_initialization = [this](std::string_view phase,
+                                                 std::size_t slots) {
+        assert(slots == completed);
+        observations.emplace_back(phase, slots);
+      };
+      resources->commit_backing = [this](std::size_t budget) {
+        assert(budget == (1 << 22));
+        assert(observations.back().first == "cache_recheck");
+        observations.emplace_back("backing", completed);
+      };
+      return resources;
+    }
+  };
+  for (const bool fail : {false, true}) {
+    auto runner = std::make_shared<ObservedRunner>();
+    runner->fail_at = fail ? 1 : 4;
+    bool rejected = false;
+    try {
+      ComponentTextCache cache(runner, 4, 1 << 22, {});
+      assert(cache.capacity() == 4 && cache.ram_budget() == (1 << 22));
+    } catch (const std::bad_alloc&) {
+      rejected = true;
+    }
+    assert(rejected == fail);
+    using Observation = std::pair<std::string, std::size_t>;
+    const std::vector<Observation> expected =
+        fail ? std::vector<Observation>{{"pre_slots", 0}, {"post_slot", 1}}
+             : std::vector<Observation>{{"pre_slots", 0},     {"post_slot", 1},
+                                        {"post_slot", 2},     {"post_slot", 3},
+                                        {"post_slot", 4},     {"post_slots", 4},
+                                        {"cache_recheck", 4}, {"backing", 4}};
+    assert(runner->observations == expected);
+  }
+}
+
 void StagingCountsAgainstRamCeiling() {
   class CeilingRunner final : public Runner {
   public:
@@ -3481,6 +3548,7 @@ int main(int argc, char** argv) {
   UnpersistedOverRamCaptureIsRefused();
   OrphansLeaveBeforeCheckpoints();
   StagingIsInternal();
+  InitializationObservationsBracketSlots();
   StagingCountsAgainstRamCeiling();
   PinnedSlotBytesCountOnce();
   UnpinnedRunnersKeepTheirLimit();

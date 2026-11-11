@@ -73,6 +73,8 @@ def startup_stage_evidence(text, readiness_observed=False):
         "readiness_observed": readiness_observed,
         "text_gate": [record for record in records
                       if record.get("event") == "vision_admission"],
+        "copy_width": [record for record in records
+                       if record.get("event") == "copy_width_selection"],
         "model_startup_completed": any(record.get("event") == "load_completed"
                                        for record in records),
         "cache_grants": [record for record in records
@@ -80,6 +82,8 @@ def startup_stage_evidence(text, readiness_observed=False):
         "cache_configuration": [record for record in records
                                 if record.get("event") == "configured"
                                 and "ram_cache" in record],
+        "cache_phases": [record for record in records
+                         if record.get("event") == "cache_initialization"],
         "cache_backing": [record for record in records
                           if record.get("event") in ("backing_prepared", "backing_grown",
                                                      "backing_limited", "ram_cache_trimmed")],

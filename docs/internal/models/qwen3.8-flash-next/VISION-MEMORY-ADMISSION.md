@@ -1,10 +1,113 @@
-# Vision admission: recorded ZBook refusal
+# Vision admission: recorded ZBook evidence
 
-This page preserves the observed refusals from the fixed-pool and earlier
-on-demand implementations as of November 10, 2026. The
-[current policy](VISION-MEMORY.md) restores upstream text/cache stage boundaries;
-the broader on-demand refusal is historical evidence, not its acceptance rule.
-Physical fit and GPU execution remain unverified by the VM.
+This page preserves owner-reported hardware observations as of November 10,
+2026. The latest candidate reached readiness with four sessions; its cache
+limits still failed the deployment target. The VM did not execute these runs.
+See the [current policy](VISION-MEMORY.md) and [validation scope](VISION-MEMORY-TESTS.md).
+
+## Ready engine with cache limits at 83c0c7a2
+
+The owner reported four execution sessions at context 262,144, MTP
+`draft_limit=7` and the BF16 projector. The engine listened and answered
+`/v1/models`. The launcher then stopped it because the effective RAM-cache
+grant was below the requested 4 GiB. This is successful initial admission and
+readiness, not qualification of four concurrent conversations or the full cache.
+
+The startup observation was:
+
+```text
+hip_free_bytes=40497627136
+device_admission_bytes=40497627136
+host_available_bytes=38883639296
+host_ceiling_bytes=34588672000
+sessions=4
+base_bytes=7529402708
+mtp_hidden_bytes=2662400
+deferred_scratch_bytes=2321955840
+total_text_bytes=30117610832
+gate=device_state
+deficit_bytes=0
+result=eligible
+```
+
+The later cache and backing observations were:
+
+```text
+requested_bytes=4294967296
+granted_bytes=3810430976
+automatic_bytes=4053223424
+staging_capacity_bytes=1048576
+backing_prepared committed_bytes=259522560
+
+segment_bytes=129761280
+outstanding_bytes=259522560
+pending_bytes=0
+capacity_bytes=64586560
+execution_pending_bytes=2937769152
+```
+
+The grant is **484,536,320 bytes (462.09 MiB)** below the requested limit.
+Physical backing stopped at **259,522,560 bytes (247.5 MiB)**; another
+129,761,280-byte segment could not fit its 64,586,560-byte runtime capacity.
+These are independent limits. `ContinuationLayout::BackingPlan()` divides a
+retention grant between payload pages and metadata/headroom; neither the grant
+nor full backing means exactly 4 GiB of payload pages. Compare the production
+plan with committed backing, and keep the requested and granted limits separate.
+The production backing-plan regression gives these logical capacities; they
+are source-derived plans, not observed page commitment:
+
+| Retention grant | Planned payload bytes | Planned backing metadata bytes |
+| ---: | ---: | ---: |
+| 4,294,967,296 | 3,802,267,648 | 59,414,528 |
+| 3,810,430,976 | 3,372,875,776 | 52,705,280 |
+
+The remainder supports the cache's other headroom and metadata. A full requested
+grant therefore plans 3,802,267,648 payload bytes, while the reported run committed
+only 259,522,560 bytes under its smaller grant.
+
+### Optional copied-token width
+
+The device gate admitted 64 copy rows. This optimization is separate from
+seven-token neural MTP. Production formulas give:
+
+| Copy rows | MTP hidden bytes per session | Deferred scratch bytes |
+| --- | ---: | ---: |
+| 8 | 368,640 | 418,013,184 |
+| 64 | 2,662,400 | 2,321,955,840 |
+| Difference | 2,293,760 | 1,903,942,656 |
+
+Across four sessions, the wider plan adds 9,175,040 bytes of initially committed
+hidden storage and 1,903,942,656 bytes of deferred work: 1,913,117,696 bytes,
+about 1.782 GiB. Removing a pending obligation is valid only when the actual
+selected execution width cannot allocate that work. Narrowing alone recovers
+only 9,175,040 initially committed bytes; with every other observation held
+constant, **475,361,280 bytes (453.34 MiB)** of the grant shortfall would remain.
+No complete-cache-fit claim follows from the scratch reduction.
+
+### Unattributed loading interval
+
+The post-slot host-budget input reconstructs as:
+
+```text
+2 * 4053223424 = 8106446848
+3810430976 + 1048576 + 4294967296 = 8106446848
+38883639296 - 8106446848 = 30777192448
+30777192448 - 29501797520 = 1275394928
+```
+
+The execution ledger implies 29,501,797,520 committed session bytes. The
+remaining **1,275,394,928 bytes** of the host-availability drop are unattributed;
+the observations do not prove a leak, allocator rounding or one shared buffer.
+Each public session also resizes a host FP32 logits vector to 248,320 values:
+993,280 requested bytes per session, or 3,973,120 across four. Native host vectors,
+adapter/ledger metadata and `DiskStore` initialization also occur in this interval.
+These known allocation sites do not measure or explain the full residual.
+Cache-resource construction creates the upstream default 64 HIP stream/event
+pairs in `TransferPool` before slots and the post-slot grant. Streams are not
+hardware queues, and no byte cost is inferred from their count. Phase observations
+in the next changed candidate must distinguish this construction interval from
+slot allocation. Independent transfer-resource optimizations require their own
+ownership/exhaustion evidence and are outside this admission correction.
 
 ## On-demand observation at 0825cdd
 

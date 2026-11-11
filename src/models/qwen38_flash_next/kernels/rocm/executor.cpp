@@ -184,7 +184,7 @@ public:
   // blocks of it committed for the next captures: ROCm commits pool pages on
   // each allocation (about 25 GB/s here), and an allocation also stalls other
   // HIP calls, so a background refill would land in a peer's decode instead.
-  static constexpr std::size_t kSpareBlocks = 2;
+  static constexpr std::size_t kSpareBlocks = kMutableSnapshotSpareBlocks;
 
   /// `reserve` is the device memory every commit leaves free.
   explicit SnapshotAllocator(
@@ -1756,25 +1756,9 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
 }
 
 std::size_t Executor::WideSegmentFloats() const {
-  const auto& c = config();
-  const std::size_t conv =
-      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t full = GdnRollbackRowFloats(
-      0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
-  const std::size_t ple =
-      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  constexpr std::uint32_t kRows =
+  constexpr std::uint32_t rows =
       static_cast<std::uint32_t>(sizeof(RollbackRows::rows) / sizeof(float*));
-  std::size_t floats = ple * (kRows + 1);
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    if (!c.IsLinearLayer(il))
-      continue;
-    floats += conv * (kRows + 1) + full;
-    for (std::uint32_t row = 0; row < kRows; ++row)
-      floats += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
-                                     c.ssm_head_dim);
-  }
-  return floats;
+  return PlanWideSegmentFloats(config(), rows);
 }
 
 bool Executor::EnsureWideSegments(std::uint32_t segments,
@@ -1859,34 +1843,12 @@ void Executor::CommitDeferredAdmission(std::size_t bytes) const {
 }
 
 std::size_t Executor::DeferredScratchBytes() const {
-  const auto& c = config();
-  std::size_t bytes = batch_logits_ == nullptr
-                          ? std::size_t{8} *
-                                std::min(8U, options_.max_logit_rows) *
-                                c.vocab_size * sizeof(float)
-                          : 0;
-  const auto linear = c.num_layers - c.num_layers / c.full_attention_interval;
-  const auto conv = std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const auto state =
-      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  const auto ple =
-      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const auto mutable_bytes = (linear * (conv + state) + ple) * sizeof(float);
-  // Slot 0 holds a pass's first in-pass checkpoint. A pass with more takes
-  // the others only while it runs (ReleasePassCheckpointStorage).
-  if (!checkpoint_storage_[0]) {
-    bytes +=
-        mutable_bytes + (has_mtp() ? std::size_t{options_.max_speculative} *
-                                         c.HcDim() * sizeof(float)
-                                   : 0);
-  }
-  // Rollback rows of a wide copy verification's later segments.
-  const std::size_t wide_segments = max_copy_rows() / 8;
-  if (wide_segments > 1 + wide_segments_.size())
-    bytes += (wide_segments - 1 - wide_segments_.size()) * WideSegmentFloats() *
-             sizeof(float);
-  // Committed spare blocks for captures, whether or not they exist yet.
-  return bytes + SnapshotAllocator::SpareBytes(mutable_bytes);
+  constexpr std::uint32_t rollback_rows =
+      static_cast<std::uint32_t>(sizeof(RollbackRows::rows) / sizeof(float*));
+  return PlanDeferredScratchBytes(
+      config(), has_mtp(), options_.max_speculative, options_.max_logit_rows,
+      max_copy_rows(), batch_logits_ != nullptr, bool(checkpoint_storage_[0]),
+      wide_segments_.size(), rollback_rows);
 }
 
 /// Column-tile width for the routed expert GEMMs: the tile at or above twice

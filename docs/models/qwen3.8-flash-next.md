@@ -45,8 +45,9 @@ proposals keep failing, a request falls back to AR for a while.
 
 MTP also proposes copies of earlier text from the same conversation, which
 speeds up answers that repeat code, tool output or a previous reply. A request
-decoding alone can check up to 64 copied tokens in one pass. The `timings`
-object in a response reports copies as `lookup_n` and `lookup_n_accepted`.
+decoding alone can check up to 64 copied tokens in one pass. On-demand memory
+admission narrows this optional width under pressure; neural MTP's draft limit
+is unchanged. Response `timings` report `lookup_n` and `lookup_n_accepted`.
 
 With greedy decoding, MTP produces exactly the AR output. With sampling, both
 modes follow the same distribution, but the same seed gives different text.

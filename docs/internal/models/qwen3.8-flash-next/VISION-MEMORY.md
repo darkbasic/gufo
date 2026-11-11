@@ -48,14 +48,47 @@ row allocation replaces that pending amount with committed ownership. Trimming
 rows restores their pending obligation before freeing them. The fixed-pool
 mode retains its earlier eager rollback and retained floor.
 
-The [same-phase ZBook observation](VISION-MEMORY-ADMISSION.md#on-demand-observation-at-0825cdd)
-was refused by the previous combined policy with a 730,301,776-byte deficit.
-The corrected device text gate has 9,971,190,448 bytes of headroom using the
-same inputs. This is eligibility, not completed startup or physical savings.
-Full-claim host arithmetic leaves about 3.820 GiB before the existing 4 GiB host
-reserve, even before an additional 512 MiB margin. Four sessions with a full
-4 GiB effective cache remain the owner's separate hardware target; a trimmed
-grant does not qualify it.
+The [latest owner-reported attempt](VISION-MEMORY-ADMISSION.md#ready-engine-with-cache-limits-at-83c0c7a2)
+reached readiness with four sessions, full context, MTP and vision. It still
+failed the owner's target: the RAM grant was 484,536,320 bytes below 4 GiB and
+backing stopped at 259,522,560 bytes. The earlier combined startup refusal is
+preserved separately in that evidence page. Text eligibility, completed startup,
+cache grant, planned payload/metadata, committed backing and image capacity are
+separate results.
+
+## Optional copied-token width
+
+Copied-token verification can use 8–64 rows. It is separate from the neural
+MTP predictor's seven-token draft limit. On-demand selection tries wider rows
+only when the device text gate fits and current host/device headroom can also
+accommodate the configured cache preference and existing runtime margin.
+Otherwise it chooses ordinary eight-row verification. This preference never
+refuses startup: the unchanged device gate subsequently checks the selected
+text/deferred requirements, and upstream cache sizing still decides the grant.
+It creates no image pool or unconditional cache backing promise.
+
+The selector uses production per-width session and deferred-work formulas.
+Its chosen bound also controls execution and retained hidden storage, so lower
+pending charges cannot leave an unchecked wider allocation enabled. Concurrent
+requests, cancellation and retained asynchronous users keep the existing
+execution-commitment and reservation ownership. Affordable wider execution
+remains available without another CLI option.
+
+For the latest recorded inputs, the selector chooses eight rows. Compared with
+64 rows this removes 1,903,942,656 bytes of accepted deferred work and only
+9,175,040 initially committed hidden bytes across four sessions. The latter
+cannot close the independent 484,536,320-byte logical-grant shortfall. These
+are formula differences, not measured physical savings; the next GPU attempt
+must establish grant, backing and remaining image capacity.
+
+Cache-initialization observations bracket resource construction and slot
+allocation. They report host/device capacity, explicit committed bytes,
+unmaterialized execution and transfer-stream count at each phase. The upstream
+64 stream/event pairs remain unchanged; the unattributed host-availability
+residual is not assigned to streams, hardware queues or allocator overhead.
+The backing event reports the real `BackingPlan()` payload and metadata beside
+its grant and committed pages; do not compare payload bytes with an exact
+4 GiB requirement.
 
 ## Arrival-time accounting
 

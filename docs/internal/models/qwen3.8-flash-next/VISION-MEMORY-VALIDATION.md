@@ -1,9 +1,10 @@
 # Vision memory admission: owner-run GPU validation
 
 Run this procedure on the ZBook's actual gfx1151 GPU after building the
-candidate. **Hardware capacity, performance and numerical image correctness
-remain unverified until checked on that GPU.** CPU accounting and simulated
-allocations do not establish GPU compilation, physical fit or numerical quality.
+candidate. The owner-reported `83c0c7a2` reached four-session readiness but
+failed the cache target. **The revised candidate, complete workload capacity,
+performance and numerical image correctness remain unqualified.** CPU accounting
+and simulated allocations do not establish GPU compilation or physical fit.
 
 The harness owns a separate loopback port and disposable cache. It never
 downloads weights, changes kernel parameters, clears production caches or stops
@@ -99,19 +100,42 @@ python3 tests/functional/vision_memory_admission.py \
   --think auto --reasoning-effort xhigh --preserve-thinking on
 ```
 
-Retain `event=vision_admission policy=on-demand` at
-`phase=post_fingerprint_pre_sessions`. It must show `vision_startup_bytes=0`
-and distinguish the device text-state gate from the host/device breakdown used
-for runtime admission. The [same-phase recorded inputs](VISION-MEMORY-ADMISSION.md#on-demand-observation-at-0825cdd)
-pass the corrected text gate with 9,971,190,448 bytes of headroom; its previous
-730,301,776-byte combined refusal is historical evidence. Do not substitute an
-earlier `vision_prepared` or later cleanup `load_failed` reading.
+This changed candidate tests one concrete correction and one unresolved interval;
+do not repeat the preceding build unchanged. Retain these observations:
+
+- `copy_width_selection` reports selected rows and `reason`. The latest recorded
+  capacities select `rows=8 reason=ordinary_fallback`; wider rows are valid if
+  the new observation supports them. `draft_limit=7` must remain unchanged.
+- `vision_admission` at `post_fingerprint_pre_sessions` reports the device text
+  gate, zero upfront image allowance and the host/device breakdown. Eligibility
+  is separate from readiness and `/v1/models` responding.
+- `cache_initialization` brackets `pre_cache_resources`/`post_cache_resources`,
+  `pre_slots`/`post_slot`/`post_slots`, the post-slot `resource_claim`, and
+  `pre_backing`/`post_backing`. Retain host/HIP capacities, explicit execution
+  commitment/pending bytes, dynamic commitment/pending bytes, remaining runtime
+  capacity and `transfer_stream_count` at each phase. Before construction the
+  actual count is zero with 64 configured; afterward the actual count is 64.
+  These intervals localize
+  the previously unattributed 1,275,394,928 bytes without assigning them to
+  streams or hardware queues by assumption.
+- `vision_cache_grant` and the component-cache configuration report the requested
+  and effective retention limit. Keep the launcher's existing full-4-GiB check.
+- `backing_prepared` reports the production plan's payload and metadata beside
+  actual committed pages. Compare commitment with `planned_payload_bytes`, not
+  with exactly 4 GiB: the configured retention budget includes metadata and
+  headroom. Preserve later growth and refusal observations separately.
+
+The [latest evidence](VISION-MEMORY-ADMISSION.md#ready-engine-with-cache-limits-at-83c0c7a2)
+had a 484,536,320-byte grant gap and only 259,522,560 committed backing bytes.
+Narrowing copy verification removes mostly unmaterialized work and cannot be
+assumed to close the grant gap. Do not substitute an earlier vision-preparation
+or later cleanup reading for a cache phase.
 
 Read the attempt in four stages: text-state eligibility, completed model
 startup/readiness, effective cache grant and backing, then image admission and
 refusal with recovery. Passing one stage does not qualify the next. The harness
-saves these separately under `startup_stages`, including trim and backing
-pressure events even on failure. Existing engine policy may legitimately trim
+saves these separately under `startup_stages`, including `copy_width`,
+`cache_phases`, plan/commitment fields, trim and backing pressure even on failure. Existing engine policy may legitimately trim
 the cache or limit its growth; this **does not qualify the owner's 4 GiB target**.
 After the requests finish, `cache_growth_qualification` checks both logs for
 `ram_cache_trimmed` or `backing_limited`. Either makes the overall qualification
@@ -119,7 +143,8 @@ fail even if `functional_workload=passed`; later successful growth does not
 erase the pressure evidence. An expected image `resource_exhausted` refusal is
 checked separately and is not treated as a cache-growth failure.
 
-If startup refuses, **stop this attempt and return its log and report**. The
+If startup refuses or the launcher rejects the cache grant, **stop this attempt
+and return its log and report**. The
 new evidence is which stage failed under the corrected source revision, with
 its current capacities and the required auxiliary services present. Do not repeat full loads,
 clear caches, change budgets or stop auxiliary services to seek readiness.
@@ -197,7 +222,7 @@ or service changes are part of this procedure.
 ## Policy compatibility
 
 The existing workstation recipe already forwards `--vision-memory-policy
-on-demand`. Add the corrective source revision after `0825cdd0977a5c3e8749f55c8435b628f2bf9500`
+on-demand`. Add the corrective source revision after `83c0c7a2623e6af3a892cd7b031032ed7e30228a`
 to that recipe's candidate source selection when the patch is reviewed and
 committed; do not reapply earlier fixes or change its workload options. Record
 the resulting revision/build provenance. This VM patch does not edit the kit or

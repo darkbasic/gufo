@@ -57,6 +57,61 @@ struct LoadedSharedMemory {
                   : std::size_t{k_heads} * dim + v_heads * (dim + 2);
 }
 
+// Copy verification uses segments of eight rows. The neural draft limit is
+// independent; optional history-copy acceleration adds further segments.
+inline constexpr std::uint32_t kCopySegmentRows = 8;
+inline constexpr std::size_t kMutableSnapshotSpareBlocks = 2;
+
+[[nodiscard]] inline std::size_t PlanWideSegmentFloats(
+    const Config& c, std::uint32_t rollback_rows) noexcept {
+  const std::size_t conv =
+      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const std::size_t full = GdnRollbackRowFloats(
+      0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
+  const std::size_t ple =
+      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  std::size_t floats = ple * (rollback_rows + 1);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (!c.IsLinearLayer(il))
+      continue;
+    floats += conv * (rollback_rows + 1) + full;
+    for (std::uint32_t row = 0; row < rollback_rows; ++row)
+      floats += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                                     c.ssm_head_dim);
+  }
+  return floats;
+}
+
+// Shared by the real executor and host-only width-selection regressions.
+// Already committed buffers are excluded; mutable snapshot spare ownership is
+// accounted separately by the runtime coordinator after materialization.
+[[nodiscard]] inline std::size_t PlanDeferredScratchBytes(
+    const Config& c, bool has_mtp, std::uint32_t speculative_rows,
+    std::uint32_t max_logit_rows, std::uint32_t copy_rows,
+    bool batch_logits_allocated, bool checkpoint_allocated,
+    std::size_t allocated_wide_segments, std::uint32_t rollback_rows) noexcept {
+  std::size_t bytes = batch_logits_allocated
+                          ? 0
+                          : std::size_t{8} * std::min(8U, max_logit_rows) *
+                                c.vocab_size * sizeof(float);
+  const auto linear = c.num_layers - c.num_layers / c.full_attention_interval;
+  const auto conv = std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const auto state =
+      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  const auto ple =
+      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  const auto mutable_bytes = (linear * (conv + state) + ple) * sizeof(float);
+  if (!checkpoint_allocated)
+    bytes += mutable_bytes + (has_mtp ? std::size_t{speculative_rows} *
+                                            c.HcDim() * sizeof(float)
+                                      : 0);
+  const std::size_t wide_segments = copy_rows / kCopySegmentRows;
+  if (wide_segments > 1 + allocated_wide_segments)
+    bytes += (wide_segments - 1 - allocated_wide_segments) *
+             PlanWideSegmentFloats(c, rollback_rows) * sizeof(float);
+  return bytes + kMutableSnapshotSpareBlocks * mutable_bytes;
+}
+
 [[nodiscard]] inline SessionMemoryBreakdown PlanSessionMemory(
     const Config& c, core::SessionMode mode, std::uint32_t context,
     std::uint32_t batch_rows, std::uint32_t speculative_rows,

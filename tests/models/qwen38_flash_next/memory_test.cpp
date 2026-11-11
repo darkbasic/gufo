@@ -7,7 +7,9 @@
 #include <limits>
 #include <string_view>
 #include <thread>
+#include <vector>
 
+#include "src/models/qwen38_flash_next/copy_width_admission.hpp"
 #include "src/models/qwen38_flash_next/execution_admission.hpp"
 #include "src/models/qwen38_flash_next/snapshot_admission.hpp"
 
@@ -27,6 +29,7 @@ qfn::Config TargetConfig() {
   qfn::Config c;
   c.num_layers = 48;
   c.hidden_size = 2560;
+  c.vocab_size = 248320;
   c.hc_count = 4;
   c.full_attention_interval = 4;
   c.num_kv_heads = 2;
@@ -101,6 +104,98 @@ void ModesAndGrowth() {
       qfn::GdnRollbackRowFloats(0, 16, 48, 128) == 786432 &&
           qfn::GdnRollbackRowFloats(1, 16, 48, 128) == 8288,
       "first frontier is full state, subsequent frontiers are exact deltas");
+}
+
+void CopyWidthSelection() {
+  const auto config = TargetConfig();
+  const auto estimate = [&](std::uint32_t rows) {
+    auto session = qfn::PlanSessionMemory(config, SessionMode::kSpeculative,
+                                          262144, 4224, 8, rows, 7, 20, 2720);
+    session.vision_descriptor_bytes = 64;
+    return qfn::CopyWidthMemory{
+        session.TotalBytes(),
+        qfn::PlanDeferredScratchBytes(config, true, 8, 8, rows, false, false, 0,
+                                      7)};
+  };
+  const auto narrow = estimate(8);
+  const auto wide = estimate(64);
+  Require(narrow.per_session_bytes == 7527108948ULL &&
+              narrow.deferred_bytes == 418013184ULL &&
+              wide.per_session_bytes == 7529402708ULL &&
+              wide.deferred_bytes == 2321955840ULL,
+          "real production formulas reproduce both observed copy widths");
+  Require(
+      wide.deferred_bytes - narrow.deferred_bytes == 1903942656ULL &&
+          4 * (wide.per_session_bytes - narrow.per_session_bytes) == 9175040,
+      "optional deferred and initially committed width costs are distinct");
+
+  constexpr std::size_t device = 40497627136ULL;
+  constexpr std::size_t host_available = 38883639296ULL;
+  constexpr std::size_t runtime = 34588672000ULL;
+  constexpr std::size_t cache = 4294967296ULL;
+  constexpr std::size_t margin = 536870912ULL;
+  Require(host_available - cache == runtime,
+          "same-phase observed host ceiling retains its existing OS reserve");
+  const auto device_gate = vision::PlanStartupMemory(
+      device, wide.deferred_bytes, wide.per_session_bytes, 0, 0, cache, margin,
+      true);
+  Require(device_gate.Fits(4), "64 rows fit the recorded text/device gate");
+  std::vector<std::uint32_t> evaluated;
+  const auto choose = [&](std::size_t device_bytes, std::size_t runtime_bytes,
+                          std::size_t cache_preference = 4294967296ULL,
+                          std::size_t sessions = 4) {
+    evaluated.clear();
+    return qfn::SelectOnDemandCopyWidth(64, sessions, device_bytes,
+                                        runtime_bytes, cache_preference, margin,
+                                        [&](std::uint32_t rows) {
+                                          evaluated.push_back(rows);
+                                          return estimate(rows);
+                                        });
+  };
+  const auto constrained = choose(device, runtime);
+  Require(
+      constrained.rows == 8 && evaluated.size() == 8 &&
+          evaluated.front() == 64 && evaluated.back() == 8 &&
+          constrained.memory.deferred_bytes == narrow.deferred_bytes,
+      "actual selector evaluates 64 through 8 and narrows under host pressure");
+  Require(
+      vision::PlanStartupMemory(device, constrained.memory.deferred_bytes,
+                                constrained.memory.per_session_bytes, 0, 0,
+                                cache, margin, true)
+          .Fits(4),
+      "unfunded optional acceleration cannot become a text startup refusal");
+  const auto needed =
+      4 * wide.per_session_bytes + wide.deferred_bytes + cache + margin;
+  Require(choose(device, needed).rows == 64 && evaluated.size() == 1,
+          "affordable optional wide verification remains enabled at exact fit");
+  Require(choose(device, needed - 1).rows == 56,
+          "one byte below wide capacity selects a bounded intermediate width");
+  Require(choose(needed - 1, device).rows == 56,
+          "either host or device budget can limit optional acceleration");
+  Require(choose(device, 0).rows == 8 &&
+              choose(device, runtime, std::numeric_limits<std::size_t>::max())
+                      .rows == 8,
+          "missing runtime preference or excessive cache preference falls back "
+          "without refusal");
+  const auto text_short =
+      4 * narrow.per_session_bytes + narrow.deferred_bytes - 1;
+  const auto insufficient = choose(text_short, device, 0);
+  Require(insufficient.rows == 8 &&
+              !vision::PlanStartupMemory(text_short,
+                                         insufficient.memory.deferred_bytes,
+                                         insufficient.memory.per_session_bytes,
+                                         0, 0, cache, margin, true)
+                   .Fits(4),
+          "fallback does not bypass genuine text-state insufficiency");
+  Require(choose(device, runtime, 0, std::numeric_limits<std::size_t>::max())
+                  .rows == 8,
+          "session multiplication cannot wrap the optional width preference");
+  Require(qfn::PlanDeferredScratchBytes(config, true, 8, 8, 64, false, false, 7,
+                                        7) == narrow.deferred_bytes &&
+              qfn::PlanDeferredScratchBytes(config, true, 8, 8, 64, true, true,
+                                            7, 7) == 236077056ULL,
+          "committed wide, batch and checkpoint buffers leave only real "
+          "remaining obligations");
 }
 
 template<class Action>
@@ -343,6 +438,7 @@ void ConcurrentSnapshotAdmission() {
 int main() {
   RecordedComponents();
   ModesAndGrowth();
+  CopyWidthSelection();
   SnapshotAdmissionOwnership();
   SnapshotAdmissionFailuresAndModes();
   LazyExecutionMaterialization();

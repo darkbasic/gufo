@@ -34,18 +34,32 @@ that has not materialized stays protected. Charges follow ownership until
 buffers and asynchronous users are released. Allocation failures and ordinary
 capacity exhaustion preserve the existing resource-error and recovery paths.
 
-The recorded same-phase observation is preserved unchanged. Its previous
-combined policy refused by **730,301,776 bytes**; the corrected Linux text gate
-passes with **9,971,190,448 bytes** of headroom. That eligibility change removes
-an acceptance condition; lazy rollback changes allocation timing. Full-claim
-host arithmetic still leaves about 3.820 GiB before the existing 4 GiB host
-reserve, and hardware may trim
-the cache or refuse backing/images. No four-session/full-cache fit is claimed.
+The latest owner-run candidate reached readiness with four full-context
+sessions, seven-token MTP and vision. The launcher correctly rejected its
+3,810,430,976-byte RAM grant; physical backing separately stopped at
+259,522,560 bytes. Automatic 64-row copied-token verification had passed the
+text gate while adding optional work to the runtime budget.
+
+Make that width choice pressure-aware: wider rows require device eligibility
+and host/device headroom for the configured cache preference plus existing
+runtime margin. Failure to fund wider acceleration selects ordinary eight-row
+verification, never a new combined startup refusal. Neural MTP's draft limit
+and every deployment setting remain unchanged. The chosen width bounds actual
+allocation and pending accounting together.
+
+At the recorded inputs, 64→8 removes 1,903,942,656 deferred bytes and 9,175,040
+initially committed hidden bytes across four sessions. Narrowing alone cannot
+close the independent 484,536,320-byte cache-grant gap. Add phase observations
+around cache-resource construction and slot allocation, with actual backing
+plan/commitment fields, to localize the remaining unattributed interval. Keep
+the upstream 64 transfer stream/event pairs; no byte cost or queue equivalence
+is assumed. Independent allocator/transfer optimizations stay outside this PR.
 See the [accounting comparison](VISION-MEMORY.md) and
 [recorded evidence](VISION-MEMORY-ADMISSION.md).
 
 CPU regressions use production admission, resource hooks and ownership with
-synthetic observations and small allocations. They distinguish startup stages,
+synthetic observations and small allocations. They execute the production width-selection path for constrained and affordable
+wide plans, distinguish startup stages,
 retain concurrency/history/replacement/failure coverage and preserve strict
 mixed-workload qualification. The harness records text eligibility, completed
 startup/readiness and cache grant/backing separately, including failed

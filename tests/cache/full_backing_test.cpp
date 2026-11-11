@@ -70,6 +70,16 @@ void Check(bool full, bool headroom, bool registration, bool query) {
     const auto payload = ledger.Snapshot().bytes[static_cast<std::size_t>(
         cache::ResourceCategory::kBackingFree)];
     assert(payload == (backed ? kPayloadBytes : 0));
+    if (!refused) {
+      assert(diagnostic.find("granted_bytes=1048576") != std::string::npos);
+      assert(diagnostic.find("planned_payload_bytes=16384") !=
+             std::string::npos);
+      assert(diagnostic.find("planned_metadata_bytes=16384") !=
+             std::string::npos);
+      assert(diagnostic.find("block_bytes=4096") != std::string::npos);
+      assert(diagnostic.find("blocks=4") != std::string::npos);
+      assert(diagnostic.find("segment_bytes=16384") != std::string::npos);
+    }
     if (backed) {
       assert(diagnostic.find("committed_bytes=16384") != std::string::npos);
       // The logical cache budget includes nonpayload overhead. Requiring it

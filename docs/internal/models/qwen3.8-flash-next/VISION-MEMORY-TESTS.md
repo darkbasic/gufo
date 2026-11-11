@@ -1,13 +1,96 @@
 # Vision admission: VM validation
 
-The results below distinguish the current scope correction from earlier
+The results below distinguish the current copy-width follow-up from earlier
 iterations in a VM without an inference GPU or model weights. No weights were
 downloaded, no inference host was accessed, and no hardware qualification ran.
 The [accounting analysis](VISION-MEMORY.md) and
 [owner-run GPU procedure](VISION-MEMORY-VALIDATION.md) describe the remaining
 physical-capacity, performance and numerical checks.
 
-## Corrective scope follow-up
+## Copy-width and cache-phase follow-up
+
+This follow-up starts from clean HEAD
+`83c0c7a2623e6af3a892cd7b031032ed7e30228a`. Its host tests exercise the production
+width selector and phase observations; they do not establish real HIP compilation
+or physical memory fit. The [owner-reported hardware evidence](VISION-MEMORY-ADMISSION.md#ready-engine-with-cache-limits-at-83c0c7a2)
+reached readiness but failed the requested cache target. The harness captures
+width selection, cache construction/slot phases and planned versus committed
+backing separately. Its two added parser regressions use small synthetic values;
+they do not imitate production memory sizing.
+
+On November 10, 2026, the following checks passed:
+
+| Current check | Result |
+| --- | --- |
+| Focused production width selector/model memory test | 1/1 passed; 0.01 seconds |
+| Cache phases, backing and production backing-plan tests | 3/3 passed; 1.43 seconds |
+| Native PR build and gate | 115/115 passed; 50.41 seconds |
+| Harness CPU evidence/orchestration tests | 38/38 passed; final run 0.019 seconds |
+| Targeted model memory ASan/UBSan with leak detection | Passed; 0.013 seconds, no diagnostics |
+| Changed C++ formatting | 11 files passed |
+| Extension API and generated infrastructure checks | Passed; API 0.2.25, 130 surface paths |
+| Documentation check | Passed; 166 Markdown files, 715 local links |
+| Python compilation and `git diff --check` | Passed |
+
+The selector test calls the same per-width selector and memory formulas as the
+runner. It starts from the recorded 64-row device fit, visits each narrower
+candidate, checks eight-row fallback under host pressure, and retains affordable
+64-row and intermediate choices. Exact boundaries, overflow, real text-state
+insufficiency and materialized deferred buffers remain covered. Cache tests
+exercise production callback ordering around actual slot construction, partial
+failure, the post-slot claim and backing commitment. The real `BackingPlan()`
+checks both the requested and measured grants, including payload and metadata.
+
+The configured CPU build used the same local dependency environment as the
+prior correction. These focused build/test commands ran in that environment:
+
+```sh
+cmake --build --preset cpu-test --parallel 2 --target qwen38_flash_next_memory_test
+ctest --preset cpu-test -R '^qwen38_flash_next\.memory$' --output-on-failure
+cmake --build --preset cpu-test --parallel 3 --target \
+  component_text_cache_test cache_full_backing_test qwen38_flash_next_continuation_layout_test
+ctest --preset cpu-test --output-on-failure -R \
+  '^(component_text_cache_test|cache_full_backing_test|qwen38_flash_next\.continuation_layout)$'
+
+env LD_LIBRARY_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu \
+  PYTHONPATH=/tmp/gufo-cpu-python \
+  PKG_CONFIG_SYSROOT_DIR=/tmp/gufo-cpu-deps \
+  PKG_CONFIG_PATH=/tmp/gufo-cpu-deps/usr/lib/x86_64-linux-gnu/pkgconfig \
+  cmake --build --preset pr --parallel 4
+
+python3 tests/functional/test_vision_memory_admission.py
+python3 -m py_compile tests/functional/vision_memory_admission.py tests/functional/test_vision_memory_admission.py
+python3 tools/ci/check-extension-api.py --write
+python3 tools/ci/generate-infrastructure.py --check
+python3 tools/ci/check-docs.py
+```
+
+Logs are `/tmp/gufo-920-copy-width-build.log`,
+`/tmp/gufo-920-cache-phases-build-final.log`,
+`/tmp/gufo-920-cache-phases-ctest-final.log` and `/tmp/gufo-920-width-pr.log`.
+The whole-tree formatting check still fails only on untouched baseline lines
+`src/cli/serve/audio_tts_api.cpp:473` and `tests/cli/openai_chat_test.cpp:6633`;
+no pinned Nix formatting pass is claimed.
+
+`/tmp/gufo-920-width-sanitizers.log` contains the exact GCC command and successful
+run. It compiles `tests/models/qwen38_flash_next/memory_test.cpp` with production
+`admission.cpp`, `ledger.cpp` and the real selector/ownership headers using
+`-std=c++20 -O1 -g -UNDEBUG -DGUFO_CACHE_TESTING -pthread
+-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all`.
+The run used `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`; compile time was 4.397 seconds.
+This is targeted CPU instrumentation, not a full-tree or HIP sanitizer run.
+
+The VM has no `hipcc` or Nix and no `/opt/rocm` or `/usr/lib/rocm` toolchain.
+Changed HIP-guarded `src/models/qwen38_flash_next/runner.cpp` and
+`src/models/qwen38_flash_next/kernels/rocm/executor.cpp` remain uncompiled here.
+The changed HIP cache-resource path is tested with simulated HIP, not real
+stream/event construction. Real HIP release compilation and the revised
+candidate's hardware qualification remain pending under the
+[owner procedure](VISION-MEMORY-VALIDATION.md). Historical results below belong
+to their stated revisions and do not add coverage for this follow-up.
+
+## Prior corrective scope follow-up
 
 The correction starts from clean HEAD
 `0825cdd0977a5c3e8749f55c8435b628f2bf9500` and preserves the earlier fixes.

@@ -3,6 +3,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include "src/models/qwen38_flash_next/cache_admission.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/continuation_identity.hpp"
+#include "src/models/qwen38_flash_next/copy_width_admission.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/probe.hpp"
@@ -292,6 +294,95 @@ StartupMemorySnapshot CollectStartupMemory() {
               .count()};
 }
 
+// Startup-only observations, deliberately separate from admission decisions.
+// The native stream/event count is a count, never an assumed driver byte cost.
+// Shared ownership permits resources to outlive their runner facade.
+struct CacheInitializationDiagnostics {
+  std::shared_ptr<Model> model;
+  std::shared_ptr<qwen::vision::AdmissionBudget> budget;
+  std::size_t initial_execution_bytes{};
+  std::atomic<std::size_t> slots{0};
+  std::atomic<std::size_t> configured_transfer_streams{0};
+  std::atomic<std::size_t> transfer_stream_count{0};
+
+  void Log(std::string_view phase,
+           const StartupMemorySnapshot& snapshot) const noexcept {
+    try {
+      const auto& host = snapshot.host;
+      const auto& device = snapshot.device;
+      const auto shared = model->LoadedSharedMemory();
+      const auto execution_pending = budget->ProtectedBytes();
+      const auto outstanding = budget->Outstanding();
+      const auto pending = budget->PendingBytes();
+      const auto subtract = [](std::size_t value, std::size_t bytes) {
+        return value > bytes ? value - bytes : 0;
+      };
+      const auto capacity = subtract(
+          subtract(
+              subtract(snapshot.capacity.available_bytes, kVisionRuntimeMargin),
+              execution_pending),
+          pending);
+      server::Logger::Info(
+          "loader",
+          "event=cache_initialization policy=on-demand phase=" +
+              std::string(phase) + " snapshot_collection_us=" +
+              std::to_string(snapshot.collection_us) + " slots=" +
+              std::to_string(slots.load()) + " configured_transfer_streams=" +
+              std::to_string(configured_transfer_streams.load()) +
+              " transfer_stream_count=" +
+              std::to_string(transfer_stream_count.load()) +
+              " hip_free_bytes=" + std::to_string(device.hip_free_bytes) +
+              " device_admission_bytes=" + std::to_string(device.free_bytes) +
+              " host_available_bytes=" +
+              std::to_string(host.raw_available_bytes) +
+              " host_budget_available_bytes=" +
+              std::to_string(host.available_bytes) +
+              " cma_excluded_bytes=" + std::to_string(host.cma_excluded_bytes) +
+              " cgroup_headroom_bytes=" +
+              (host.cgroup_headroom_bytes
+                   ? std::to_string(*host.cgroup_headroom_bytes)
+                   : "unknown") +
+              " host_reserve_bytes=" + std::to_string(host.reserve_bytes) +
+              " host_ceiling_bytes=" + std::to_string(host.ceiling_bytes) +
+              " automatic_bytes=" +
+              std::to_string(host.automatic_budget_bytes) +
+              " selected_limiter=" + snapshot.capacity.LimiterName() +
+              " loaded_weight_bytes=" + std::to_string(model->ResidentBytes()) +
+              " loaded_shared_device_bytes=" +
+              std::to_string(shared.device_bytes) +
+              " loaded_shared_host_bytes=" + std::to_string(shared.host_bytes) +
+              " execution_committed_bytes=" +
+              std::to_string(
+                  subtract(initial_execution_bytes, execution_pending)) +
+              " execution_pending_bytes=" + std::to_string(execution_pending) +
+              " outstanding_bytes=" + std::to_string(outstanding) +
+              " pending_bytes=" + std::to_string(pending) +
+              " dynamic_committed_bytes=" +
+              std::to_string(subtract(outstanding, pending)) +
+              " runtime_margin_bytes=" + std::to_string(kVisionRuntimeMargin) +
+              " runtime_capacity_bytes=" + std::to_string(capacity) +
+              " allocation_scope=explicit_requested_bytes");
+    } catch (...) {
+      // An observation must not change a grant or a successful initialization.
+    }
+  }
+
+  void Observe(std::string_view phase) const noexcept {
+    try {
+      Log(phase, CollectStartupMemory());
+    } catch (...) {
+      // Query failure leaves admission and cache policy with their ordinary
+      // checks. Do not turn optional diagnostics into a startup prerequisite.
+      try {
+        server::Logger::Info(
+            "loader", "event=cache_initialization policy=on-demand phase=" +
+                          std::string(phase) + " observation=unavailable");
+      } catch (...) {
+      }
+    }
+  }
+};
+
 void LogVisionAdmission(
     const StartupMemorySnapshot& snapshot,
     const std::optional<qwen::vision::StartupMemoryPlan>& plan,
@@ -471,6 +562,10 @@ public:
                          : 0;
             },
             execution);
+        cache_diagnostics_ = std::make_shared<CacheInitializationDiagnostics>();
+        cache_diagnostics_->model = model_;
+        cache_diagnostics_->budget = vision_budget_;
+        cache_diagnostics_->initial_execution_bytes = execution;
       } else {
         vision_budget_ = std::make_shared<qwen::vision::AdmissionBudget>(
             vision_memory_bytes);
@@ -524,6 +619,11 @@ public:
         server::Logger::Warn("cache", std::string(message));
       };
     }
+    if (cache_diagnostics_) {
+      cache_diagnostics_->configured_transfer_streams.store(
+          hooks.transfer_streams);
+      cache_diagnostics_->Observe("pre_cache_resources");
+    }
     auto resources = hip::CreateHipComponentCacheResources(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
             model_,
@@ -531,13 +631,29 @@ public:
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_),
         ledger, std::move(hooks));
+    if (cache_diagnostics_) {
+      cache_diagnostics_->transfer_stream_count.store(
+          cache_diagnostics_->configured_transfer_streams.load());
+      cache_diagnostics_->Observe("post_cache_resources");
+      resources->observe_initialization = [diagnostics = cache_diagnostics_](
+                                              std::string_view phase,
+                                              std::size_t slots) {
+        diagnostics->slots.store(slots);
+        diagnostics->Observe(phase);
+      };
+    }
     if (vision_budget_) {
       const auto commit = resources->commit_backing;
       resources->commit_backing =
-          [commit, budget = vision_budget_, required = required_cache_bytes_,
+          [commit, budget = vision_budget_, diagnostics = cache_diagnostics_,
+           required = required_cache_bytes_,
            reserved = cache_reserve_bytes_](std::size_t granted) {
             ValidateVisionCacheGrant(budget, required, granted, reserved);
+            if (diagnostics)
+              diagnostics->Observe("pre_backing");
             commit(granted);
+            if (diagnostics)
+              diagnostics->Observe("post_backing");
             const auto on_demand = budget->OnDemand();
             server::Logger::Info(
                 "loader", std::string("event=vision_cache_grant policy=") +
@@ -602,10 +718,30 @@ public:
         max_context_);
     const auto session_bytes =
         vision_plan_ ? vision_plan_->per_session_bytes : legacy_session_bytes;
+    std::optional<ext::HostSnapshotMemory> cache_host;
+    std::optional<hip::AdmissionMemory> memory;
+    if (vision_budget_ && vision_budget_->OnDemand()) {
+      const auto started = std::chrono::steady_clock::now();
+      cache_host = ext::QueryHostSnapshotMemory();
+      memory =
+          hip::QueryAdmissionMemoryUsingHost(cache_host->raw_available_bytes);
+      if (memory && cache_diagnostics_) {
+        cache_diagnostics_->Log(
+            "resource_claim",
+            {*cache_host, *memory,
+             qwen::vision::SelectStartupCapacity(memory->free_bytes,
+                                                 cache_host->ceiling_bytes),
+             std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now() - started)
+                 .count()});
+      }
+    } else if (!vision_plan_) {
+      memory = gufo::hip::QueryAdmissionMemory();
+    }
     std::optional<std::size_t> capacity;
     if (vision_plan_ && !vision_budget_->OnDemand()) {
       capacity = vision_plan_->state_capacity_bytes;
-    } else if (const auto memory = gufo::hip::QueryAdmissionMemory()) {
+    } else if (memory) {
       const auto deferred = model_->DeferredScratchBytes();
       capacity =
           memory->free_bytes > deferred ? memory->free_bytes - deferred : 0;
@@ -629,7 +765,8 @@ public:
     // couple text admission to host/cache/runtime-image limits.
     if (capacity && vision_budget_ && vision_budget_->OnDemand())
       capacity = std::min(*capacity, configured_text_bytes_);
-    auto ceiling = HostSnapshotCeilingBytes();
+    auto ceiling =
+        cache_host ? cache_host->ceiling_bytes : HostSnapshotCeilingBytes();
     if (vision_budget_ && !vision_budget_->OnDemand()) {
       const auto reserved = qwen::vision::CheckedAdd(
           execution_headroom_bytes_, vision_budget_->Capacity());
@@ -647,7 +784,8 @@ public:
         .retained_snapshot_capacity_bytes =
             vision_budget_ && !vision_budget_->OnDemand()
                 ? std::min(HostSnapshotBudgetBytes(), ceiling)
-                : HostSnapshotBudgetBytes(),
+            : cache_host ? cache_host->automatic_budget_bytes
+                         : HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = ceiling,
         .requires_device_runtime_lock = true,
     };
@@ -1088,6 +1226,7 @@ private:
   std::size_t execution_headroom_bytes_{0};
   std::optional<qwen::vision::StartupMemoryPlan> vision_plan_;
   std::shared_ptr<qwen::vision::AdmissionBudget> vision_budget_;
+  std::shared_ptr<CacheInitializationDiagnostics> cache_diagnostics_;
   cache::Identity component_identity_;
 };
 
@@ -1268,7 +1407,36 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
       // Copy-width choice and final admission must use this same collection,
       // not the earlier vision-preparation or later failure-cleanup readings.
       startup_memory = CollectStartupMemory();
-      if (use_mtp) {
+      if (use_mtp && on_demand) {
+        const auto choice = SelectOnDemandCopyWidth(
+            rocm::Executor::kWideRows,
+            std::max<std::size_t>(options.session_count, 1),
+            startup_memory->device.free_bytes,
+            startup_memory->capacity.available_bytes, cache_reserve,
+            kVisionRuntimeMargin, [&](std::uint32_t rows) {
+              model->LimitCopyRows(rows);
+              return CopyWidthMemory{
+                  model->TextSessionBytes(core::SessionMode::kSpeculative,
+                                          max_context),
+                  model->DeferredScratchBytes()};
+            });
+        server::Logger::Info(
+            "loader",
+            "event=copy_width_selection policy=on-demand rows=" +
+                std::to_string(choice.rows) + " reason=" +
+                (choice.rows == kCopySegmentRows ? "ordinary_fallback"
+                                                 : "headroom") +
+                " device_capacity_bytes=" +
+                std::to_string(startup_memory->device.free_bytes) +
+                " runtime_capacity_bytes=" +
+                std::to_string(startup_memory->capacity.available_bytes) +
+                " cache_preference_bytes=" + std::to_string(cache_reserve) +
+                " runtime_margin_bytes=" +
+                std::to_string(kVisionRuntimeMargin) + " base_bytes=" +
+                std::to_string(choice.memory.per_session_bytes) +
+                " deferred_scratch_bytes=" +
+                std::to_string(choice.memory.deferred_bytes));
+      } else if (use_mtp) {
         for (std::uint32_t rows = rocm::Executor::kWideRows;; rows -= 8) {
           model->LimitCopyRows(rows);
           const auto mode = core::SessionMode::kSpeculative;
