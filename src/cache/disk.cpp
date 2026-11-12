@@ -285,12 +285,15 @@ platform::Directory DirectoryAt(const platform::Directory& parent,
   return directory;
 }
 template<typename F>
-void Scan(const platform::Directory& directory, F visit) {
+void Scan(const platform::Directory& directory, F visit,
+          std::uint64_t* entry_stats = nullptr) {
   const StartupPhase phase("directory_scan");
   std::error_code ec;
   if (!platform::ListDirectory(
           directory,
           [&](std::string_view name, const platform::FileInfo& info) {
+            if (entry_stats)
+              ++*entry_stats;
             // ListDirectory reports every entry; callers expect regular
             // files only.
             if (info.regular)
@@ -638,7 +641,8 @@ struct DiskStore::Impl {
   std::future<void> reclamation;
 
   Impl(ResourceLedger& l, const std::filesystem::path& path,
-       std::uint64_t budget, ResourceReservation reservation)
+       std::uint64_t budget, ResourceReservation reservation,
+       const DiskRecoveryObserver& observer)
       : ledger(&l),
         metadata(reservation.Convert()),
         root(OpenRoot(path)),
@@ -659,18 +663,24 @@ struct DiskStore::Impl {
     std::size_t manifest_count{};
     for (const platform::Directory* directory :
          {&manifests, &chunks, &private_files})
-      Scan(*directory,
-           [&](const std::string& name, const platform::FileInfo& st) {
-             if (ParseName(name)) {
-               stats.managed_bytes = Add(stats.managed_bytes, st.size);
-               if (directory == &manifests)
-                 ++manifest_count;
-             }
-           });
-    Scan(temporary, [&](const std::string& name, const platform::FileInfo& st) {
-      if (ParseName(name))
-        stats.managed_bytes = Add(stats.managed_bytes, st.size);
-    });
+      Scan(
+          *directory,
+          [&](const std::string& name, const platform::FileInfo& st) {
+            if (ParseName(name)) {
+              stats.managed_bytes = Add(stats.managed_bytes, st.size);
+              if (directory == &manifests)
+                ++manifest_count;
+            }
+          },
+          &stats.directory_entry_stats);
+    Scan(
+        temporary,
+        [&](const std::string& name, const platform::FileInfo& st) {
+          if (ParseName(name))
+            stats.managed_bytes = Add(stats.managed_bytes, st.size);
+        },
+        &stats.directory_entry_stats);
+    ObserveRecovery(observer, "after_directories");
     if (manifest_count) {
       auto entry_reservation =
           ledger->Reserve(ResourceCategory::kMetadata,
@@ -682,20 +692,25 @@ struct DiskStore::Impl {
       entry_capacity = entry_reservation.Convert();
       entries.swap(allocated);
     }
-    Scan(manifests, [&](const std::string& name, const platform::FileInfo& st) {
-      auto id = ParseName(name);
-      if (!id)
-        return;
-      try {
-        auto entry = ReadManifest(name, st);
-        entry.file_ = *id;
-        entry.epoch_ = next_epoch++;
-        entries.push_back(std::move(entry));
-      } catch (const std::invalid_argument&) {
-        ++stats.rejected_manifests;
-      }
-    });
-    ValidateReferences();
+    Scan(
+        manifests,
+        [&](const std::string& name, const platform::FileInfo& st) {
+          auto id = ParseName(name);
+          if (!id)
+            return;
+          try {
+            auto entry = ReadManifest(name, st);
+            entry.file_ = *id;
+            entry.epoch_ = next_epoch++;
+            entries.push_back(std::move(entry));
+          } catch (const std::invalid_argument&) {
+            ++stats.rejected_manifests;
+          }
+        },
+        &stats.directory_entry_stats);
+    ObserveRecovery(observer, "after_manifests");
+    ValidateReferences(observer);
+    ObserveRecovery(observer, "after_validation");
     // Rejected manifests still own on-disk claims until durably reclaimed. A
     // new write could otherwise fill their missing dependencies and resurrect
     // conflicting checkpoint identities on the next restart.
@@ -718,10 +733,22 @@ struct DiskStore::Impl {
       node = {};
     }
   }
-  void ValidateReferences() {
+  void ObserveRecovery(const DiskRecoveryObserver& observer,
+                       std::string_view phase) const noexcept {
+    if (observer) {
+      try {
+        observer(phase, stats);
+      } catch (...) {
+        // Diagnostics never change recovery acceptance or ownership.
+      }
+    }
+  }
+  void ValidateReferences(const DiskRecoveryObserver& observer) {
     const StartupPhase phase("reference_validation");
-    if (entries.empty())
+    if (entries.empty()) {
+      ObserveRecovery(observer, "validation_live");
       return;
+    }
 #ifdef GUFO_CACHE_TESTING
     const auto hook = reference_validation_hook;
     if (hook)
@@ -885,6 +912,7 @@ struct DiskStore::Impl {
         ++stats.rejected_manifests;
       return remove;
     });
+    ObserveRecovery(observer, "validation_live");
   }
   // Applies ValidateReferences' rules to the publication candidate, the last
   // entry. Indexed entries were already validated against each other, so only
@@ -1642,9 +1670,14 @@ DurableEntry& DurableEntry::operator=(DurableEntry&& other) noexcept {
 DiskStore::DiskStore(ResourceLedger& ledger,
                      const std::filesystem::path& directory,
                      std::uint64_t budget)
+    : DiskStore(ledger, directory, budget, {}) {}
+DiskStore::DiskStore(ResourceLedger& ledger,
+                     const std::filesystem::path& directory,
+                     std::uint64_t budget, const DiskRecoveryObserver& observer)
     : impl_(std::make_unique<Impl>(
           ledger, directory, budget,
-          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)))) {}
+          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)),
+          observer)) {}
 DiskStore::~DiskStore() = default;
 std::span<const DurableEntry> DiskStore::Entries() const {
   return impl_->entries;

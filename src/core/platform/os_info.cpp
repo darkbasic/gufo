@@ -1,10 +1,18 @@
 #include "src/core/platform/os_info.hpp"
 
+#include <array>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
+
+#include "src/core/platform/memory_observation_detail.hpp"
 
 #if defined(_WIN32)
 // clang-format off: psapi.h and bcrypt.h need the windows.h types above them,
@@ -23,6 +31,163 @@
 #endif
 
 namespace gufo::platform {
+
+namespace {
+std::string_view Trim(std::string_view text) noexcept {
+  constexpr std::string_view whitespace = " \t\r";
+  const auto begin = text.find_first_not_of(whitespace);
+  if (begin == std::string_view::npos)
+    return {};
+  return text.substr(begin, text.find_last_not_of(whitespace) - begin + 1);
+}
+
+std::string_view Token(std::string_view& text) noexcept {
+  text = Trim(text);
+  const auto end = text.find_first_of(" \t\r");
+  const auto token = text.substr(0, end);
+  text = end == std::string_view::npos ? std::string_view{} : text.substr(end);
+  return token;
+}
+
+std::optional<std::uint64_t> Unsigned(std::string_view text) noexcept {
+  if (text.empty() || text.front() < '0' || text.front() > '9')
+    return {};
+  std::uint64_t value{};
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size())
+    return {};
+  return value;
+}
+
+template<class F>
+void Lines(std::string_view text, F consume) noexcept {
+  if (text.size() > detail::kMemoryObservationFileLimit)
+    return;
+  while (!text.empty()) {
+    const auto end = text.find('\n');
+    consume(Trim(text.substr(0, end)));
+    text = end == std::string_view::npos ? std::string_view{}
+                                         : text.substr(end + 1);
+  }
+}
+
+std::optional<std::uint64_t> Kilobytes(std::string_view text,
+                                       std::string_view key) noexcept {
+  bool found{};
+  std::optional<std::uint64_t> result;
+  Lines(text, [&](std::string_view line) {
+    const auto colon = line.find(':');
+    if (colon == std::string_view::npos || Trim(line.substr(0, colon)) != key)
+      return;
+    if (found) {
+      result.reset();
+      return;
+    }
+    found = true;
+    auto rest = line.substr(colon + 1);
+    const auto value = Unsigned(Token(rest));
+    if (Token(rest) == "kB" && Trim(rest).empty() && value &&
+        *value <= std::numeric_limits<std::uint64_t>::max() / 1024)
+      result = *value * 1024;
+  });
+  return result;
+}
+
+std::optional<std::uint64_t> ArcSize(std::string_view text) noexcept {
+  bool found{};
+  std::optional<std::uint64_t> result;
+  Lines(text, [&](std::string_view line) {
+    if (Token(line) != "size")
+      return;
+    if (found) {
+      result.reset();
+      return;
+    }
+    found = true;
+    // KSTAT_DATA_UINT64 records contain name, type (4), and byte value.
+    if (Token(line) != "4")
+      return;
+    const auto value = Unsigned(Token(line));
+    if (Trim(line).empty())
+      result = value;
+  });
+  return result;
+}
+
+// Use one fixed buffer for all three files. A read failure or overlong file is
+// wholly unavailable; never silently report a successfully parsed prefix.
+std::string_view ReadObservationFile(
+    const char* path,
+    std::array<char, detail::kMemoryObservationFileLimit>& buffer) noexcept {
+  auto* file = std::fopen(path, "r");
+  if (!file)
+    return {};
+  const auto size = std::fread(buffer.data(), 1, buffer.size(), file);
+  const bool complete =
+      !std::ferror(file) && std::fgetc(file) == EOF && !std::ferror(file);
+  std::fclose(file);
+  return complete ? std::string_view(buffer.data(), size) : std::string_view{};
+}
+}  // namespace
+
+namespace detail {
+MemoryObservation ParseMemoryObservation(
+    std::string_view process_status, std::string_view host_meminfo,
+    std::string_view zfs_arcstats) noexcept {
+  MemoryObservation result;
+  result.process_rss_bytes = Kilobytes(process_status, "VmRSS");
+  result.process_peak_rss_bytes = Kilobytes(process_status, "VmHWM");
+  result.host_available_bytes = Kilobytes(host_meminfo, "MemAvailable");
+  result.host_cached_bytes = Kilobytes(host_meminfo, "Cached");
+  result.host_slab_bytes = Kilobytes(host_meminfo, "Slab");
+  result.host_reclaimable_slab_bytes = Kilobytes(host_meminfo, "SReclaimable");
+  result.zfs_arc_size_bytes = ArcSize(zfs_arcstats);
+  return result;
+}
+
+MemoryObservation ReadMemoryObservationFiles(
+    const char* process_status, const char* host_meminfo,
+    const char* zfs_arcstats) noexcept {
+  std::array<char, kMemoryObservationFileLimit> buffer;
+  auto result = ParseMemoryObservation(
+      ReadObservationFile(process_status, buffer), {}, {});
+  const auto host =
+      ParseMemoryObservation({}, ReadObservationFile(host_meminfo, buffer), {});
+  result.host_available_bytes = host.host_available_bytes;
+  result.host_cached_bytes = host.host_cached_bytes;
+  result.host_slab_bytes = host.host_slab_bytes;
+  result.host_reclaimable_slab_bytes = host.host_reclaimable_slab_bytes;
+  result.zfs_arc_size_bytes =
+      ParseMemoryObservation({}, {}, ReadObservationFile(zfs_arcstats, buffer))
+          .zfs_arc_size_bytes;
+  return result;
+}
+}  // namespace detail
+
+MemoryObservation QueryMemoryObservation() noexcept {
+  const auto begin = std::chrono::steady_clock::now();
+  MemoryObservation result;
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  counters.cb = sizeof(counters);
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    result.process_rss_bytes = counters.WorkingSetSize;
+    result.process_peak_rss_bytes = counters.PeakWorkingSetSize;
+  }
+  MEMORYSTATUSEX memory{};
+  memory.dwLength = sizeof(memory);
+  if (GlobalMemoryStatusEx(&memory))
+    result.host_available_bytes = memory.ullAvailPhys;
+#else
+  result = detail::ReadMemoryObservationFiles(
+      "/proc/self/status", "/proc/meminfo", "/proc/spl/kstat/zfs/arcstats");
+#endif
+  result.collection_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+  return result;
+}
 
 std::size_t PageSizeBytes() {
 #if defined(_WIN32)

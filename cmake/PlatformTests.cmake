@@ -21,3 +21,8 @@ add_executable(platform_pages_test
 target_link_libraries(platform_pages_test PRIVATE Threads::Threads)
 add_test(NAME platform_pages_test COMMAND platform_pages_test)
 set_tests_properties(platform_pages_test PROPERTIES LABELS "cpu;platform")
+
+add_executable(memory_observation_test tests/core/memory_observation_test.cpp)
+target_link_libraries(memory_observation_test PRIVATE gufo_platform)
+add_test(NAME memory_observation_test COMMAND memory_observation_test)
+set_tests_properties(memory_observation_test PROPERTIES LABELS "cpu;platform")

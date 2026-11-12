@@ -65,6 +65,29 @@ struct HostMemory {
 /// Returns nullopt when the OS cannot report its memory.
 std::optional<HostMemory> QueryHostMemory();
 
+/// Diagnostic observations, never an admission budget. Missing, malformed or
+/// unsupported values are nullopt; an observed zero remains zero. Linux reads
+/// process RSS/high-water RSS, MemAvailable/Cached/Slab/SReclaimable and
+/// optional ZFS ARC size. Windows reports working-set/current peak and
+/// available host RAM. These categories overlap: do not add them as independent
+/// allocations.
+struct MemoryObservation {
+  std::optional<std::uint64_t> process_rss_bytes;
+  std::optional<std::uint64_t> process_peak_rss_bytes;
+  std::optional<std::uint64_t> host_available_bytes;
+  std::optional<std::uint64_t> host_cached_bytes;
+  std::optional<std::uint64_t> host_slab_bytes;
+  std::optional<std::uint64_t> host_reclaimable_slab_bytes;
+  std::optional<std::uint64_t> zfs_arc_size_bytes;
+  std::uint64_t collection_us{};
+};
+
+/// Best-effort, bounded OS reads with no polling. Values are collected in
+/// sequence, not an atomic system-wide snapshot; collection_us is elapsed time
+/// for this observation. No allocator instrumentation or admission side
+/// effects.
+MemoryObservation QueryMemoryObservation() noexcept;
+
 /// Fills `out` with the process's local calendar time for `seconds`.
 /// Returns false when the platform cannot convert the time.
 bool LocalTime(std::time_t seconds, std::tm* out) noexcept;

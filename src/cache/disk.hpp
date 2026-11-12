@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/cache/checkpoint.hpp"
@@ -97,7 +98,18 @@ struct DiskStartupStats {
   // cold recovery. dependency_stats counts actual dependency StatAt calls;
   // the initial directory enumeration also stats files independently.
   std::uint64_t dependency_references{}, distinct_dependency_files{};
+  // Successful metadata observations reported by startup directory scans,
+  // including ignored/nonregular entries and the second manifest scan.
+  // Excludes dependency_stats and stats of opened manifest files.
+  std::uint64_t directory_entry_stats{};
 };
+// Four synchronous constructor-only boundaries, independent of file count:
+// after_directories, after_manifests, validation_live, after_validation.
+// validation_live retains temporary validation storage; after_validation does
+// not. Exceptions are ignored; observers must not mutate the cache or ledger.
+// No observer is retained by the store or invoked by publication/restore.
+using DiskRecoveryObserver =
+    std::function<void(std::string_view, const DiskStartupStats&)>;
 // Host-buffer publication only; caller retains and admits immutable buffers
 // until Publish returns. Full chunks already referenced by a checkpoint can be
 // omitted.
@@ -223,6 +235,8 @@ class DiskStore {
 public:
   DiskStore(ResourceLedger&, const std::filesystem::path& directory,
             std::uint64_t budget_bytes);
+  DiskStore(ResourceLedger&, const std::filesystem::path& directory,
+            std::uint64_t budget_bytes, const DiskRecoveryObserver& observer);
   ~DiskStore();
   DiskStore(const DiskStore&) = delete;
   DiskStore& operator=(const DiskStore&) = delete;

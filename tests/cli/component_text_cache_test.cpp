@@ -2694,6 +2694,36 @@ void RecoveredManifestStorageCountsOnce() {
     std::clog.rdbuf(previous_sink);
     Logger::SetLevel(previous_level);
     assert(runner->owner.expired());
+    // Exactly eight samples, independent of persistence contents. These are
+    // diagnostics only: the grant/pressure assertions above remain unchanged.
+    const auto text = output.str();
+    constexpr std::array<std::string_view, 8> phases{
+        "post_cache_resources", "before_disk_recovery",
+        "after_directories",    "after_manifests",
+        "validation_live",      "after_validation",
+        "after_disk_recovery",  "pre_slots"};
+    std::size_t position{};
+    for (const auto phase : phases) {
+      const auto found = text.find("event=recovery_memory phase=", position);
+      assert(found != std::string::npos);
+      const auto end = text.find('\n', found);
+      const auto line = std::string_view(text).substr(found, end - found);
+      assert(line.starts_with(
+          "event=recovery_memory phase=" + std::string(phase) + " "));
+      for (const auto field :
+           {"sample_begin_us=", "since_previous_sample_us=", "collection_us=",
+            "process_rss_bytes=", "process_peak_rss_bytes=",
+            "host_available_bytes=", "host_cached_bytes=", "host_slab_bytes=",
+            "host_reclaimable_slab_bytes=", "zfs_arc_size_bytes=",
+            "directory_entry_stats=", "dependency_stats=",
+            "logical_reserved_metadata_bytes="})
+        assert(line.find(field) != std::string_view::npos);
+      assert(line.find("snapshot_atomic=false categories_overlap=true") !=
+             std::string_view::npos);
+      position = end;
+    }
+    assert(text.find("event=recovery_memory phase=", position) ==
+           std::string::npos);
     assert(output.str().find(" capacity_bytes=" +
                              std::to_string(kBudget - shortfall)) !=
            std::string::npos);

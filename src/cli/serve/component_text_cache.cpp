@@ -204,6 +204,8 @@ struct ComponentTextCache::Impl {
     bool busy{};
   };
   std::shared_ptr<TextModelRunner> runner;
+  const Clock::time_point startup_begin{Clock::now()};
+  Clock::time_point previous_memory_sample{startup_begin};
   cache::ResourceLedger ledger;
   std::unique_ptr<ComponentCacheResources> resources;
   cache::Identity identity;
@@ -241,6 +243,57 @@ struct ComponentTextCache::Impl {
   bool ram_enabled{true};
   cache::ResourceCharge metadata;
 
+  // Fixed startup boundaries only. OS counters have different scopes and are
+  // sequential observations, never admission inputs or additive allocations.
+  void ObserveRecoveryMemory(
+      std::string_view phase,
+      const cache::DiskStartupStats& stats = {}) noexcept {
+    try {
+      const auto started = Clock::now();
+      const auto memory = platform::QueryMemoryObservation();
+      const auto logical = ledger.Snapshot();
+      const auto bytes = [](const std::optional<std::uint64_t>& value) {
+        return value ? std::to_string(*value) : std::string("unavailable");
+      };
+      const auto micros = [](auto duration) {
+        return std::to_string(
+            std::chrono::duration_cast<std::chrono::microseconds>(duration)
+                .count());
+      };
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=recovery_memory phase=" +
+              std::string(phase) + " sample_begin_us=" +
+              micros(started - startup_begin) + " since_previous_sample_us=" +
+              micros(started - previous_memory_sample) +
+              " collection_us=" + std::to_string(memory.collection_us) +
+              " snapshot_atomic=false categories_overlap=true "
+              "process_rss_bytes=" +
+              bytes(memory.process_rss_bytes) + " process_peak_rss_bytes=" +
+              bytes(memory.process_peak_rss_bytes) +
+              " host_available_bytes=" + bytes(memory.host_available_bytes) +
+              " host_cached_bytes=" + bytes(memory.host_cached_bytes) +
+              " host_slab_bytes=" + bytes(memory.host_slab_bytes) +
+              " host_reclaimable_slab_bytes=" +
+              bytes(memory.host_reclaimable_slab_bytes) +
+              " zfs_arc_size_bytes=" + bytes(memory.zfs_arc_size_bytes) +
+              " directory_entry_stats=" +
+              std::to_string(stats.directory_entry_stats) +
+              " dependency_stats=" + std::to_string(stats.dependency_stats) +
+              " manifest_bytes_read=" +
+              std::to_string(stats.manifest_bytes_read) +
+              " logical_ram_bytes=" + std::to_string(logical.ram_bytes) +
+              " logical_peak_ram_bytes=" +
+              std::to_string(logical.peak_ram_bytes) +
+              " logical_reserved_metadata_bytes=" +
+              std::to_string(logical.reserved_bytes[static_cast<std::size_t>(
+                  cache::ResourceCategory::kMetadata)]));
+      previous_memory_sample = started;
+    } catch (...) {
+      // Missing telemetry or logging capacity must not affect startup.
+    }
+  }
+
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
        const std::optional<TextRunnerDiskCacheOptions>& options,
@@ -260,8 +313,13 @@ struct ComponentTextCache::Impl {
           const auto unlimited = std::numeric_limits<std::size_t>::max();
           return {unlimited, unlimited, staging, kDiskOnlyBackingBytes};
         }()),
-        resources(this->runner->CreateComponentCacheResourcesForSessions(
-            ledger, ram, count)),
+        resources([&] {
+          auto result = this->runner->CreateComponentCacheResourcesForSessions(
+              ledger, ram, count);
+          if (options)
+            ObserveRecoveryMemory("post_cache_resources");
+          return result;
+        }()),
         identity(resources->adapter->CompatibilityIdentity()),
         index(ledger),
         retention(ledger, index, &events),
@@ -290,20 +348,27 @@ struct ComponentTextCache::Impl {
                          std::to_string(ledger.Limits().staging_bytes));
       // Take directory ownership before slots and backing commit, so a
       // second server fails without claiming its RAM budget first.
+      ObserveRecoveryMemory("before_disk_recovery");
       const auto recovery_begin = Clock::now();
-      disk = std::make_unique<cache::DiskStore>(ledger, options->directory,
-                                                options->capacity_bytes);
+      disk = std::make_unique<cache::DiskStore>(
+          ledger, options->directory, options->capacity_bytes,
+          [this](std::string_view phase, const cache::DiskStartupStats& stats) {
+            ObserveRecoveryMemory(phase, stats);
+          });
       const auto recovery_us =
           std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
                                                                 recovery_begin)
               .count();
       const auto stats = disk->Stats();
+      ObserveRecoveryMemory("after_disk_recovery", stats);
       const auto logical = ledger.Snapshot();
       Logger::Info(
           "cache",
           "schema=component-cache-v1 event=disk_recovered manifests=" +
               std::to_string(disk->Entries().size()) + " manifest_bytes_read=" +
               std::to_string(stats.manifest_bytes_read) +
+              " directory_entry_stats=" +
+              std::to_string(stats.directory_entry_stats) +
               " dependency_stats=" + std::to_string(stats.dependency_stats) +
               " dependency_references=" +
               std::to_string(stats.dependency_references) +
@@ -318,6 +383,8 @@ struct ComponentTextCache::Impl {
               std::to_string(logical.peak_ram_bytes) +
               " recovery_us=" + std::to_string(recovery_us));
     }
+    if (disk)
+      ObserveRecoveryMemory("pre_slots", disk->Stats());
     if (resources->observe_initialization)
       resources->observe_initialization("pre_slots", 0);
     for (std::size_t i = 0; i < count; ++i) {

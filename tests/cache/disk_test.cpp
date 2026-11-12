@@ -310,6 +310,116 @@ void Ownership() {
   }
   DiskStore reopened(ledger, d.path, 100000);
 }
+void RecoveryObservations() {
+  constexpr std::array<std::string_view, 4> expected_phases{
+      "after_directories", "after_manifests", "validation_live",
+      "after_validation"};
+  struct Observation {
+    std::string_view phase;
+    DiskStartupStats stats;
+    ResourceSnapshot logical;
+  };
+  for (bool populated : {false, true}) {
+    for (bool throwing : {false, true}) {
+      Directory d;
+      ResourceLedger local{{1 << 20, 1 << 20, 0, 0}};
+      auto manifest = Manifest();
+      const std::array<std::uint8_t, 8> chunk{};
+      const std::array<std::uint8_t, 4> tail{};
+      const std::array<std::uint8_t, 16> state{};
+      manifest.components[0].chunks[0].checksum = DiskChecksum(chunk);
+      manifest.components[0].tail->checksum = DiskChecksum(tail);
+      manifest.components[1].private_state->checksum = DiskChecksum(state);
+      std::size_t manifest_bytes{};
+      if (populated) {
+        {
+          DiskStore initialize(local, d.path, UINT64_MAX);
+        }
+        Payloads(d.path, manifest);
+        Put(d.path, manifest);
+        manifest_bytes = EncodeManifest(manifest).size();
+        // Enumeration stats include entries the regular-file/name filters
+        // ignore. They are distinct from the three dependency observations.
+        const auto chunks = d.path / "v2/chunks";
+        Write(chunks / "unmanaged", chunk);
+        fs::create_symlink("unmanaged", chunks / "unmanaged-link");
+        fs::create_directory(chunks / "unmanaged-directory");
+      }
+      std::array<Observation, 4> observations{};
+      std::size_t calls{};
+      const DiskRecoveryObserver observer = [&](std::string_view phase,
+                                                const DiskStartupStats& stats) {
+        assert(calls < observations.size());
+        observations[calls++] = {phase, stats, local.Snapshot()};
+        if (throwing)
+          throw std::bad_alloc();
+      };
+      actual_manifest_bytes = actual_payload_bytes = 0;
+      {
+        DiskStore store(local, d.path, UINT64_MAX, observer);
+        assert(calls == expected_phases.size());
+        for (std::size_t i = 0; i < calls; ++i) {
+          assert(observations[i].phase == expected_phases[i]);
+          assert(observations[i].stats.directory_entry_stats ==
+                 (populated ? (i == 0 ? 7 : 8) : 0));
+          assert(observations[i].stats.manifest_bytes_read ==
+                 (i == 0 ? 0 : manifest_bytes));
+          assert(observations[i].stats.dependency_stats ==
+                 (populated && i >= 2 ? 3 : 0));
+        }
+        assert(store.Entries().size() == static_cast<std::size_t>(populated));
+        assert(store.Stats().rejected_manifests == 0);
+        assert(actual_manifest_bytes == manifest_bytes &&
+               actual_payload_bytes == 0);
+        const auto metadata =
+            static_cast<std::size_t>(ResourceCategory::kMetadata);
+        if (populated) {
+          assert(observations[2].logical.ram_bytes >
+                 observations[3].logical.ram_bytes);
+          assert(observations[2].logical.reserved_bytes[metadata] > 0);
+        } else {
+          assert(observations[2].logical.ram_bytes ==
+                 observations[3].logical.ram_bytes);
+        }
+        assert(observations[1].logical.ram_bytes ==
+               observations[3].logical.ram_bytes);
+        assert(observations[3].logical.reserved_bytes[metadata] == 0);
+        assert(observations[3].logical.ram_bytes == local.Snapshot().ram_bytes);
+        if (populated) {
+          {
+            const auto snapshot = store.Open(manifest.checkpoint);
+            assert(snapshot);
+            std::array<std::uint8_t, 3> staging{};
+            std::size_t copied{};
+            const auto read = store.ReadPayload(
+                *snapshot, false, manifest.components[0].chunks[0], staging,
+                [&](auto offset, auto bytes) {
+                  assert(offset == copied &&
+                         std::ranges::equal(bytes, std::span(chunk).subspan(
+                                                       offset, bytes.size())));
+                  copied += bytes.size();
+                });
+            assert(copied == chunk.size() && read.bytes == chunk.size());
+          }
+          auto next = manifest;
+          next.checkpoint = {8};
+          next.components[0].tail->file = Id(12);
+          next.components[1].private_state->file = Id(13);
+          const std::array<DiskWriteBuffer, 2> buffers{
+              {{true, Id(12), tail}, {true, Id(13), state}}};
+          store.Publish(Id(8), next, buffers);
+          assert(store.Open(next.checkpoint));
+          assert(store.Stats().directory_entry_stats == 8);
+        }
+        // Observations are constructor-only, not callbacks for later restore
+        // or publication activity, even when every observer call threw.
+        assert(calls == expected_phases.size());
+      }
+      assert(calls == expected_phases.size());
+      assert(local.Snapshot().total_bytes == 0);
+    }
+  }
+}
 void Index() {
   Directory d;
   {
@@ -1094,6 +1204,7 @@ int main() {
   ChecksumReference();
   LargePieceReadAndCorruption();
   Ownership();
+  RecoveryObservations();
   Index();
   Conflicts();
   AllConflictOwners();
