@@ -303,8 +303,13 @@ struct ComponentTextCache::Impl {
           "cache",
           "schema=component-cache-v1 event=disk_recovered manifests=" +
               std::to_string(disk->Entries().size()) + " manifest_bytes_read=" +
-              std::to_string(stats.manifest_bytes_read) + " dependency_stats=" +
-              std::to_string(stats.dependency_stats) + " rejected_manifests=" +
+              std::to_string(stats.manifest_bytes_read) +
+              " dependency_stats=" + std::to_string(stats.dependency_stats) +
+              " dependency_references=" +
+              std::to_string(stats.dependency_references) +
+              " distinct_dependency_files=" +
+              std::to_string(stats.distinct_dependency_files) +
+              " rejected_manifests=" +
               std::to_string(stats.rejected_manifests) +
               " owned_manifest_bytes=" +
               std::to_string(disk->OwnedManifestBytes()) +

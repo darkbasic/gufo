@@ -1,0 +1,93 @@
+--- baseline/disk.cpp
++++ instrumented/disk.cpp
+@@ -29,7 +29,34 @@
+ namespace {
+ #ifdef GUFO_CACHE_TESTING
+ thread_local void (*reference_validation_hook)(bool) noexcept {};
++thread_local void (*startup_phase_hook)(const char*, bool) noexcept {};
+ #endif
++// No clocks or callbacks in production. The CPU benchmark observes nested
++// recovery scopes without replacing filesystem or validation code.
++struct StartupPhase {
++  explicit StartupPhase(const char* name) noexcept
++#ifdef GUFO_CACHE_TESTING
++      : name_(name), hook_(startup_phase_hook)
++#endif
++  {
++#ifdef GUFO_CACHE_TESTING
++    if (hook_)
++      hook_(name_, true);
++#else
++    (void)name;
++#endif
++  }
++  ~StartupPhase() {
++#ifdef GUFO_CACHE_TESTING
++    if (hook_)
++      hook_(name_, false);
++#endif
++  }
++#ifdef GUFO_CACHE_TESTING
++  const char* name_;
++  void (*hook_)(const char*, bool) noexcept;
++#endif
++};
+ template<class F>
+ struct Finally {
+   F action;
+@@ -258,6 +285,7 @@
+ }
+ template<typename F>
+ void Scan(const platform::Directory& directory, F visit) {
++  const StartupPhase phase("directory_scan");
+   std::error_code ec;
+   if (!platform::ListDirectory(
+           directory,
+@@ -661,12 +689,15 @@
+         auto entry = ReadManifest(name, st);
+         auto& m = entry.manifest_;
+         bool available = true;
+-        for (const auto& c : m.components) {
+-          for (const auto& p : c.chunks)
+-            available = Check(chunks, p) && available;
+-          for (auto p : {c.tail, c.private_state})
+-            if (p)
+-              available = Check(private_files, *p) && available;
++        {
++          const StartupPhase phase("dependency_checks");
++          for (const auto& c : m.components) {
++            for (const auto& p : c.chunks)
++              available = Check(chunks, p) && available;
++            for (auto p : {c.tail, c.private_state})
++              if (p)
++                available = Check(private_files, *p) && available;
++          }
+         }
+         if (!available)
+           Invalid();
+@@ -701,6 +732,7 @@
+     }
+   }
+   void ValidateReferences() {
++    const StartupPhase phase("reference_validation");
+     if (entries.empty())
+       return;
+ #ifdef GUFO_CACHE_TESTING
+@@ -1499,6 +1531,7 @@
+   }
+   DurableEntry ReadManifest(const std::string& name,
+                             const platform::FileInfo& found) {
++    const StartupPhase phase("manifest_read_decode");
+     if (!Regular(found) || found.size < 20 || found.size > kMaxManifestBytes)
+       Invalid();
+     std::error_code ec;
+@@ -1876,6 +1909,9 @@
+     impl_->reclamation.get();
+ }
+ #ifdef GUFO_CACHE_TESTING
++void DiskStore::SetStartupPhaseHook(void (*hook)(const char*, bool) noexcept) {
++  startup_phase_hook = hook;
++}
+ void DiskStore::SetReferenceValidationHook(void (*hook)(bool) noexcept) {
+   reference_validation_hook = hook;
+ }

@@ -93,6 +93,10 @@ struct DiskStartupStats {
   std::uint64_t manifest_bytes_read{};
   std::uint64_t dependency_stats{}, rejected_manifests{};
   std::uint64_t managed_bytes{};
+  // Decoded references versus unique (namespace, file ID) observations during
+  // cold recovery. dependency_stats counts actual dependency StatAt calls;
+  // the initial directory enumeration also stats files independently.
+  std::uint64_t dependency_references{}, distinct_dependency_files{};
 };
 // Host-buffer publication only; caller retains and admits immutable buffers
 // until Publish returns. Full chunks already referenced by a checkpoint can be
@@ -274,6 +278,10 @@ public:
   // Current-thread scope around reference validation, after filesystem
   // discovery. Both notifications are nonthrowing, including during unwind.
   static void SetReferenceValidationHook(void (*)(bool entering) noexcept);
+  // Current-thread nested scopes for model-free recovery profiling. Never
+  // called in production builds; callbacks must not throw or allocate.
+  static void SetStartupPhaseHook(void (*)(const char* phase,
+                                           bool entering) noexcept);
 #endif
 
 private:

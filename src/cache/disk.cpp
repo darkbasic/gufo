@@ -29,7 +29,35 @@ struct DiskAvailability {
 namespace {
 #ifdef GUFO_CACHE_TESTING
 thread_local void (*reference_validation_hook)(bool) noexcept {};
+thread_local void (*startup_phase_hook)(const char*, bool) noexcept {};
 #endif
+// No clocks or callbacks in production. The CPU benchmark observes nested
+// recovery scopes without replacing filesystem or validation code.
+struct StartupPhase {
+  explicit StartupPhase(const char* name) noexcept
+#ifdef GUFO_CACHE_TESTING
+      : name_(name),
+        hook_(startup_phase_hook)
+#endif
+  {
+#ifdef GUFO_CACHE_TESTING
+    if (hook_)
+      hook_(name_, true);
+#else
+    (void)name;
+#endif
+  }
+  ~StartupPhase() {
+#ifdef GUFO_CACHE_TESTING
+    if (hook_)
+      hook_(name_, false);
+#endif
+  }
+#ifdef GUFO_CACHE_TESTING
+  const char* name_;
+  void (*hook_)(const char*, bool) noexcept;
+#endif
+};
 template<class F>
 struct Finally {
   F action;
@@ -258,6 +286,7 @@ platform::Directory DirectoryAt(const platform::Directory& parent,
 }
 template<typename F>
 void Scan(const platform::Directory& directory, F visit) {
+  const StartupPhase phase("directory_scan");
   std::error_code ec;
   if (!platform::ListDirectory(
           directory,
@@ -659,17 +688,6 @@ struct DiskStore::Impl {
         return;
       try {
         auto entry = ReadManifest(name, st);
-        auto& m = entry.manifest_;
-        bool available = true;
-        for (const auto& c : m.components) {
-          for (const auto& p : c.chunks)
-            available = Check(chunks, p) && available;
-          for (auto p : {c.tail, c.private_state})
-            if (p)
-              available = Check(private_files, *p) && available;
-        }
-        if (!available)
-          Invalid();
         entry.file_ = *id;
         entry.epoch_ = next_epoch++;
         entries.push_back(std::move(entry));
@@ -701,6 +719,7 @@ struct DiskStore::Impl {
     }
   }
   void ValidateReferences() {
+    const StartupPhase phase("reference_validation");
     if (entries.empty())
       return;
 #ifdef GUFO_CACHE_TESTING
@@ -716,11 +735,12 @@ struct DiskStore::Impl {
     // Private bytes cannot be aliased across checkpoints. Reject every side
     // of a conflict, independent of filesystem enumeration order.
     struct Claim {
-      const DiskManifest* manifest;
-      const ComponentDescriptor* descriptor;
-      const DiskPayload* payload;
-      Rows first;
-      bool conflict{};
+      const DiskManifest* manifest{};
+      const ComponentDescriptor* descriptor{};
+      const DiskPayload* payload{};
+      Rows first{};
+      std::uint64_t observed_bytes{};
+      bool regular{}, conflict{};
     };
     using Key = std::pair<bool, DiskFileId>;
     std::size_t references{};
@@ -728,9 +748,10 @@ struct DiskStore::Impl {
       for (const auto& c : entry.manifest_.components)
         references = Add(
             references, c.chunks.size() + bool(c.tail) + bool(c.private_state));
-    // Keep one borrowed claim per distinct file, not an owner vector or heap
-    // geometry per reference. A second complete pass marks every conflicting
-    // owner. This also bounds actual storage when many manifests share files.
+    stats.dependency_references = references;
+    // One temporary node per distinct dependency: first its filesystem
+    // observation, then its borrowed canonical claim. Do not index orphan
+    // directory entries or retain another metadata cache after recovery.
     // The reservation covers worst-case distinct nodes, tree/allocator overhead
     // and the two compact arrays. It is temporary working capacity, never
     // evidence of retained physical backing.
@@ -746,6 +767,48 @@ struct DiskStore::Impl {
     if (checkpoints.capacity() != entries.size() ||
         rejected.capacity() != entries.size())
       throw std::logic_error("unexpected disk validation capacity");
+    {
+      const StartupPhase phase("dependency_checks");
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto check = [&](bool is_private, const DiskPayload& p) {
+          auto [it, inserted] = claims.try_emplace({is_private, p.file});
+          auto& observed = it->second;
+          if (inserted) {
+            ++stats.dependency_stats;
+            platform::FileInfo st{};
+            std::error_code ec;
+            observed.regular =
+                platform::StatAt(is_private ? private_files : chunks,
+                                 DiskFileName(p.file), false, &st, ec) &&
+                Regular(st);
+            // Allocation pressure is not evidence of a corrupt dependency.
+            // Abort recovery and relinquish ownership; do not discard owners.
+            if (!observed.regular && ec == std::errc::not_enough_memory)
+              throw std::bad_alloc();
+            observed.observed_bytes = st.size;
+          }
+          // Compare each reference with the actual size, not with whether a
+          // different owner's first claim passed. Bad claims cannot poison
+          // later compatible owners of the same file.
+          rejected[i] |=
+              !observed.regular || observed.observed_bytes != p.bytes;
+        };
+        for (const auto& c : entries[i].manifest_.components) {
+          for (const auto& p : c.chunks)
+            check(false, p);
+          for (const auto* p : {&c.tail, &c.private_state})
+            if (*p)
+              check(true, p->value());
+        }
+      }
+      stats.distinct_dependency_files = claims.size();
+    }
+    // Only complete manifests participate in geometry/alias and checkpoint-ID
+    // conflicts, preserving the previous filter-before-conflict behavior.
+    // Reuse observations only within this exclusive-ownership recovery. An
+    // external writer ignoring LOCK is not made safe by repeated stat calls;
+    // restore must still check its opened file, identity and payload checksum.
+    std::size_t available{};
     const auto geometry = [](const Claim& c) {
       const auto& d = *c.descriptor;
       return std::array<std::uint64_t, 9>{c.manifest->lineage.value,
@@ -760,15 +823,18 @@ struct DiskStore::Impl {
     };
     for (std::size_t i = 0; i < entries.size(); ++i) {
       const auto& m = entries[i].manifest_;
-      checkpoints[i] = i;
+      if (rejected[i])
+        continue;
+      checkpoints[available++] = i;
       const auto claim = [&](bool is_private, const DiskPayload& p,
                              const ComponentDescriptor& d, Rows first) {
         const Claim current{&m, &d, &p, first};
-        auto [it, inserted] = claims.try_emplace({is_private, p.file}, current);
-        auto& previous = it->second;
-        if (!inserted && (is_private ||
-                          previous.manifest->compatibility != m.compatibility ||
-                          geometry(previous) != geometry(current)))
+        auto& previous = claims.at({is_private, p.file});
+        if (!previous.manifest)
+          previous = current;
+        else if (is_private ||
+                 previous.manifest->compatibility != m.compatibility ||
+                 geometry(previous) != geometry(current))
           previous.conflict = true;
       };
       for (const auto& c : m.components) {
@@ -782,7 +848,10 @@ struct DiskStore::Impl {
             claim(true, p->value(), c.descriptor, first);
       }
     }
+    checkpoints.resize(available);
     for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (rejected[i])
+        continue;
       const auto conflict = [&](bool is_private, const DiskPayload& p) {
         return claims.at({is_private, p.file}).conflict;
       };
@@ -1499,6 +1568,7 @@ struct DiskStore::Impl {
   }
   DurableEntry ReadManifest(const std::string& name,
                             const platform::FileInfo& found) {
+    const StartupPhase phase("manifest_read_decode");
     if (!Regular(found) || found.size < 20 || found.size > kMaxManifestBytes)
       Invalid();
     std::error_code ec;
@@ -1551,13 +1621,6 @@ struct DiskStore::Impl {
     if (retained)
       entry.metadata_ = retained.Convert();
     return entry;
-  }
-  bool Check(const platform::Directory& directory, const DiskPayload& p) {
-    ++stats.dependency_stats;
-    platform::FileInfo st{};
-    std::error_code ec;
-    return platform::StatAt(directory, DiskFileName(p.file), false, &st, ec) &&
-           Regular(st) && st.size == p.bytes;
   }
 };
 DurableEntry& DurableEntry::operator=(DurableEntry&& other) noexcept {
@@ -1876,6 +1939,9 @@ void DiskStore::WaitForReclamation() {
     impl_->reclamation.get();
 }
 #ifdef GUFO_CACHE_TESTING
+void DiskStore::SetStartupPhaseHook(void (*hook)(const char*, bool) noexcept) {
+  startup_phase_hook = hook;
+}
 void DiskStore::SetReferenceValidationHook(void (*hook)(bool) noexcept) {
   reference_validation_hook = hook;
 }

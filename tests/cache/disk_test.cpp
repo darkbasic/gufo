@@ -328,6 +328,8 @@ void Index() {
     assert(store.Entries()[0].Durable() &&
            !store.Entries()[0].PayloadVerified());
     assert(store.Stats().manifest_bytes_read == encoded_size);
+    assert(store.Stats().dependency_references == 3);
+    assert(store.Stats().distinct_dependency_files == 3);
     assert(store.Stats().dependency_stats == 3);
     assert(actual_manifest_bytes == encoded_size && actual_payload_bytes == 0);
     assert(store.Stats().managed_bytes == encoded_size + 28);
@@ -494,6 +496,151 @@ void MissingDependenciesAndRestart() {
     assert(restored.OwnedManifestBytes() == ManifestStorage(m));
   }
 }
+void SharedDependencyRecovery() {
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  const std::array<std::uint8_t, 8> bytes{1, 2, 3, 4, 5, 6, 7, 8};
+  std::array<DiskManifest, 3> owners;
+  for (unsigned i = 0; i < owners.size(); ++i) {
+    auto& m = owners[i];
+    m = Manifest();
+    m.checkpoint = {7 + i};
+    m.components[0].chunks[0].checksum = DiskChecksum(bytes);
+    m.components[0].tail->file = Id(10 + i);
+    // Equal IDs in the two namespaces name different dependencies, whose
+    // sizes also differ. A filename-only observation cache is incorrect.
+    m.components[1].private_state->file = Id(i ? 20 + i : 1);
+    Payloads(d.path, m);
+    Put(d.path, m, 100 + i);
+  }
+  const auto shared = d.path / "v2/chunks" / DiskFileName(Id(1));
+  const auto alias = d.path / "alias";
+  Write(shared, bytes);
+  const auto counts = [](const DiskStore& store) {
+    const auto stats = store.Stats();
+    assert(stats.dependency_references == 9);
+    assert(stats.distinct_dependency_files == 7);
+    assert(stats.dependency_stats == 7);
+  };
+  for (unsigned failure = 0; failure < 4; ++failure) {
+    // Each recovery gets fresh metadata; observations must not persist across
+    // stores. Every owner of the unavailable shared dependency is rejected.
+    if (failure == 0)
+      fs::remove(shared);
+    if (failure == 1)
+      fs::resize_file(shared, bytes.size() - 1);
+    if (failure == 2) {
+      fs::remove(shared);
+      Write(alias, bytes);
+      fs::create_symlink(alias, shared);
+    }
+    if (failure == 3)
+      fs::create_hard_link(shared, alias);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore rejected(ledger, d.path, UINT64_MAX);
+      counts(rejected);
+      assert(rejected.Entries().empty());
+      assert(rejected.Stats().rejected_manifests == owners.size());
+      assert(actual_manifest_bytes && actual_payload_bytes == 0);
+    }
+    fs::remove(shared);
+    fs::remove(alias);
+    Write(shared, bytes);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore restored(ledger, d.path, UINT64_MAX);
+      counts(restored);
+      assert(restored.Entries().size() == owners.size());
+      assert(restored.Stats().rejected_manifests == 0);
+      assert(actual_manifest_bytes && actual_payload_bytes == 0);
+      const auto snapshot = restored.Open({7});
+      assert(snapshot);
+      std::array<std::uint8_t, 3> staging{};
+      std::size_t copied{};
+      const auto read = restored.ReadPayload(
+          *snapshot, false, owners[0].components[0].chunks[0], staging,
+          [&](auto offset, auto piece) {
+            assert(offset == copied &&
+                   std::ranges::equal(
+                       piece, std::span(bytes).subspan(offset, piece.size())));
+            copied += piece.size();
+          });
+      assert(copied == bytes.size() && read.bytes == bytes.size() &&
+             !read.verification_cached);
+    }
+    assert(ledger.Snapshot().total_bytes == 0);
+  }
+  // Startup metadata reuse never attests payload contents. A same-size
+  // mutation after recovery must still fail the first restore checksum.
+  {
+    DiskStore store(ledger, d.path, UINT64_MAX);
+    const auto snapshot = store.Open({7});
+    assert(snapshot);
+    auto corrupt = bytes;
+    corrupt[0] ^= 1;
+    Write(shared, corrupt);
+    std::array<std::uint8_t, 3> staging{};
+    bool invalid = false;
+    try {
+      (void)store.ReadPayload(*snapshot, false,
+                              owners[0].components[0].chunks[0], staging,
+                              [](auto, auto) {});
+    } catch (const DiskDependencyError& error) {
+      invalid = !error.private_file && error.file == Id(1);
+    }
+    assert(invalid);
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
+}
+void UnavailableOwnersDoNotConflict() {
+  // Availability filtering precedes both canonical-reference validation and
+  // duplicate checkpoint IDs. An unavailable owner's claims cannot poison a
+  // compatible available owner, regardless of filesystem enumeration order.
+  for (unsigned failure = 0; failure < 2; ++failure) {
+    Directory d;
+    {
+      DiskStore init(ledger, d.path, UINT64_MAX);
+    }
+    auto good = Manifest(), bad = good;
+    bad.components[0].tail->file = Id(12);
+    bad.components[1].private_state->file = Id(13);
+    ++bad.components[0].chunks[0].checksum;
+    if (failure == 0) {
+      // Both references are individually well formed, but only the good
+      // owner's size matches the observed file. Cache actual size, not the
+      // outcome of checking the first reference encountered.
+      bad.components[0].descriptor.row_bytes *= 2;
+      bad.components[0].chunks[0].bytes *= 2;
+      bad.components[0].tail->bytes *= 2;
+    }
+    Payloads(d.path, bad);
+    Payloads(d.path, good);
+    if (failure == 1)
+      fs::remove(d.path / "v2/private" / DiskFileName(Id(13)));
+    for (bool reverse : {false, true}) {
+      Put(d.path, reverse ? bad : good, 100);
+      Put(d.path, reverse ? good : bad, 101);
+      actual_manifest_bytes = actual_payload_bytes = 0;
+      {
+        DiskStore store(ledger, d.path, UINT64_MAX);
+        const auto stats = store.Stats();
+        assert(stats.dependency_references == 6);
+        assert(stats.distinct_dependency_files == 5);
+        assert(stats.dependency_stats == 5);
+        assert(stats.rejected_manifests == 1);
+        assert(store.Entries().size() == 1);
+        assert(EncodeManifest(store.Entries()[0].Manifest()) ==
+               EncodeManifest(good));
+        assert(store.OwnedManifestBytes() == ManifestStorage(good));
+        assert(actual_manifest_bytes && actual_payload_bytes == 0);
+      }
+      assert(ledger.Snapshot().total_bytes == 0);
+    }
+  }
+}
 void RootSymlinks() {
   Directory d, target;
   Write(target.path / "file", std::array<std::uint8_t, 4>{1, 2, 3, 4});
@@ -564,9 +711,11 @@ void MetadataAdmission() {
     }
     assert(succeeded);
   }
-  // Walk actual reference-validation allocations, including ledger tokens,
-  // nodes and arrays. Keep injection out of unrelated noexcept filesystem
-  // wrappers. Whole-construction ledger faults remain covered above.
+  // Walk actual recovery-validation allocations, including ledger tokens,
+  // nodes, arrays and dependency StatAt pathname storage. StatAt reports OOM
+  // through its no-throw boundary; recovery must abort without rejecting valid
+  // owners. Other startup filesystem wrappers remain outside this scope.
+  // Whole-construction ledger faults remain covered above.
   DiskStore::SetReferenceValidationHook([](bool entering) noexcept {
     fail_allocation_after = entering ? validation_failure_after : -1;
   });
@@ -949,6 +1098,8 @@ int main() {
   Conflicts();
   AllConflictOwners();
   MissingDependenciesAndRestart();
+  SharedDependencyRecovery();
+  UnavailableOwnersDoNotConflict();
   BudgetAndDirectories();
   CapacityBeforePayloadReads();
   VerifiedDependencies();
