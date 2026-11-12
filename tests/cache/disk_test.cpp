@@ -910,6 +910,120 @@ void BudgetAndDirectories() {
   Reject([&] { DiskStore store(ledger, d.path, UINT64_MAX); });
   assert(fs::is_empty(unrelated.path));
 }
+void ManagedUsageRequiresPayloadMetadata() {
+  const std::array<std::uint8_t, 8> chunk{1, 2, 3, 4};
+  const std::array<std::uint8_t, 4> tail{5, 6};
+  const std::array<std::uint8_t, 16> state{7, 8, 9};
+  auto first = Manifest();
+  first.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  first.components[0].tail->checksum = DiskChecksum(tail);
+  first.components[1].private_state->checksum = DiskChecksum(state);
+  const std::array<DiskWriteBuffer, 3> initial{
+      {{false, Id(1), chunk}, {true, Id(2), tail}, {true, Id(3), state}}};
+  const auto first_bytes =
+      EncodeManifest(first).size() + chunk.size() + tail.size() + state.size();
+  {
+    Directory directory;
+    auto next = first;
+    next.checkpoint = {8};
+    next.components[0].tail->file = Id(12);
+    next.components[1].private_state->file = Id(13);
+    const std::array<DiskWriteBuffer, 2> additional{
+        {{true, Id(12), tail}, {true, Id(13), state}}};
+    // Exactly enough for both manifests and their distinct referenced files.
+    // A manifest-only sum cannot account for unrelated orphan/temp storage.
+    const auto budget =
+        first_bytes + EncodeManifest(next).size() + tail.size() + state.size();
+    {
+      DiskStore store(ledger, directory.path, budget);
+      store.Publish(Id(7), first, initial);
+      assert(store.Stats().managed_bytes == first_bytes);
+    }
+    constexpr std::size_t kOrphanBytes = 64 << 10, kTemporaryBytes = 17;
+    const auto orphan = directory.path / "v2/chunks" / DiskFileName(Id(90));
+    const auto temporary = directory.path / "v2/tmp" / DiskFileName(Id(91));
+    Write(orphan, {});
+    fs::resize_file(orphan, kOrphanBytes);
+    Write(temporary, {});
+    fs::resize_file(temporary, kTemporaryBytes);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore store(ledger, directory.path, budget);
+      assert(store.Entries().size() == 1);
+      assert(store.Stats().managed_bytes ==
+             first_bytes + kOrphanBytes + kTemporaryBytes);
+      assert(store.Stats().directory_entry_stats == 7);
+      assert(store.Stats().dependency_stats == 3);
+      assert(actual_manifest_bytes == EncodeManifest(first).size());
+      assert(actual_payload_bytes == 0);
+      bool exhausted = false;
+      try {
+        store.Publish(Id(8), next, additional);
+      } catch (const DiskCapacityExhausted&) {
+        exhausted = true;
+      }
+      assert(exhausted && actual_payload_bytes == 0);
+      assert(store.Entries().size() == 1 && !store.Open({8}));
+      store.ReclaimOrphans();
+      store.WaitForReclamation();
+      assert(!fs::exists(orphan) && !fs::exists(temporary));
+      assert(store.Stats().managed_bytes == first_bytes);
+      store.Publish(Id(8), next, additional);
+      assert(store.Stats().managed_bytes == budget);
+      assert(store.Entries().size() == 2);
+    }
+    {
+      DiskStore reopened(ledger, directory.path, budget);
+      assert(reopened.Stats().managed_bytes == budget);
+      assert(reopened.Entries().size() == 2);
+      const auto snapshot = reopened.Open(next.checkpoint);
+      assert(snapshot);
+      const auto read = [&](bool private_file, const DiskPayload& payload,
+                            std::span<const std::uint8_t> expected) {
+        std::array<std::uint8_t, 5> staging{};
+        std::size_t copied{};
+        const auto result = reopened.ReadPayload(
+            *snapshot, private_file, payload, staging,
+            [&](auto offset, auto bytes) {
+              assert(offset == copied &&
+                     std::ranges::equal(
+                         bytes, expected.subspan(offset, bytes.size())));
+              copied += bytes.size();
+            });
+        assert(copied == expected.size() && result.bytes == expected.size());
+      };
+      read(false, next.components[0].chunks[0], chunk);
+      read(true, *next.components[0].tail, tail);
+      read(true, *next.components[1].private_state, state);
+    }
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
+  {
+    Directory directory;
+    {
+      DiskStore store(ledger, directory.path, UINT64_MAX);
+      store.Publish(Id(7), first, initial);
+    }
+    const auto chunks = directory.path / "v2/chunks";
+    const auto directory_mtime = fs::last_write_time(chunks);
+    // No namespace change: a persisted directory timestamp or manifest size
+    // sum cannot attest the current managed bytes of an existing payload.
+    constexpr std::size_t kGrownBytes = 64 << 10;
+    fs::resize_file(chunks / DiskFileName(Id(1)), kGrownBytes);
+    assert(fs::last_write_time(chunks) == directory_mtime);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    DiskStore recovered(ledger, directory.path, UINT64_MAX);
+    assert(recovered.Stats().managed_bytes ==
+           first_bytes - chunk.size() + kGrownBytes);
+    assert(recovered.Stats().directory_entry_stats == 5);
+    assert(recovered.Stats().dependency_stats == 3);
+    assert(recovered.Stats().rejected_manifests == 1);
+    assert(recovered.Entries().empty() && !recovered.Open(first.checkpoint));
+    assert(actual_manifest_bytes == EncodeManifest(first).size());
+    assert(actual_payload_bytes == 0);
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
+}
 void CapacityBeforePayloadReads() {
   Directory directory;
   auto first = Manifest();
@@ -1212,6 +1326,7 @@ int main() {
   SharedDependencyRecovery();
   UnavailableOwnersDoNotConflict();
   BudgetAndDirectories();
+  ManagedUsageRequiresPayloadMetadata();
   CapacityBeforePayloadReads();
   VerifiedDependencies();
   RootSymlinks();

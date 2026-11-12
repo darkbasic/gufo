@@ -4,6 +4,10 @@ This follow-up adds bounded production observations to the shared cache-startup
 path. It does not establish a memory saving or change text admission, cache
 grants, reserves, vision admission or lazy backing.
 
+The owner has since collected these observations. See the
+[r12 filesystem-metadata audit and remaining constraint](cache-recovery-metadata.md)
+before scheduling another owner attempt.
+
 ## Established evidence and remaining constraint
 
 The owner tested Gufo 0.34.0 with `temp11`, based on
