@@ -27,6 +27,9 @@ struct DiskAvailability {
 };
 }  // namespace detail
 namespace {
+#ifdef GUFO_CACHE_TESTING
+thread_local void (*reference_validation_hook)(bool) noexcept {};
+#endif
 template<class F>
 struct Finally {
   F action;
@@ -700,47 +703,73 @@ struct DiskStore::Impl {
   void ValidateReferences() {
     if (entries.empty())
       return;
+#ifdef GUFO_CACHE_TESTING
+    const auto hook = reference_validation_hook;
+    if (hook)
+      hook(true);
+    const Finally leave_scope{[hook] {
+      if (hook)
+        hook(false);
+    }};
+#endif
     // Shared files must describe the same immutable lineage/range/layout.
     // Private bytes cannot be aliased across checkpoints. Reject every side
     // of a conflict, independent of filesystem enumeration order.
     struct Claim {
-      CompatibilityDigest compatibility;
-      std::vector<std::uint64_t> geometry;
-      std::vector<std::size_t> entries;
+      const DiskManifest* manifest;
+      const ComponentDescriptor* descriptor;
+      const DiskPayload* payload;
+      Rows first;
       bool conflict{};
     };
+    using Key = std::pair<bool, DiskFileId>;
     std::size_t references{};
     for (const auto& entry : entries)
       for (const auto& c : entry.manifest_.components)
         references = Add(
             references, c.chunks.size() + bool(c.tail) + bool(c.private_state));
-    // Cover map records, geometry arrays, vector growth and tree links before
-    // building the temporary cross-manifest reference catalog.
+    // Keep one borrowed claim per distinct file, not an owner vector or heap
+    // geometry per reference. A second complete pass marks every conflicting
+    // owner. This also bounds actual storage when many manifests share files.
+    // The reservation covers worst-case distinct nodes, tree/allocator overhead
+    // and the two compact arrays. It is temporary working capacity, never
+    // evidence of retained physical backing.
     auto working = ledger->Reserve(
         ResourceCategory::kMetadata,
-        Add(Multiply(references, sizeof(Claim) + sizeof(DiskFileId) +
-                                     24 * sizeof(std::uint64_t)),
-            Multiply(entries.size(), 96)));
-    std::map<std::pair<bool, DiskFileId>, Claim> claims;
-    std::map<std::uint64_t, std::vector<std::size_t>> checkpoints;
-    std::vector<bool> rejected(entries.size());
+        Add(Add(Multiply(references,
+                         sizeof(Claim) + sizeof(Key) + 8 * sizeof(void*)),
+                Multiply(entries.size(), sizeof(std::size_t) + 1)),
+            2 * 64));
+    std::map<Key, Claim> claims;
+    std::vector<std::size_t> checkpoints(entries.size());
+    std::vector<std::uint8_t> rejected(entries.size());
+    if (checkpoints.capacity() != entries.size() ||
+        rejected.capacity() != entries.size())
+      throw std::logic_error("unexpected disk validation capacity");
+    const auto geometry = [](const Claim& c) {
+      const auto& d = *c.descriptor;
+      return std::array<std::uint64_t, 9>{c.manifest->lineage.value,
+                                          d.id.value,
+                                          d.layout_version,
+                                          d.row_bytes,
+                                          d.rows_per_chunk,
+                                          c.first,
+                                          c.payload->bytes,
+                                          c.payload->checksum,
+                                          d.window_rows};
+    };
     for (std::size_t i = 0; i < entries.size(); ++i) {
       const auto& m = entries[i].manifest_;
-      checkpoints[m.checkpoint.value].push_back(i);
-      auto claim = [&](bool is_private, const DiskPayload& p,
-                       const ComponentDescriptor& d, std::uint64_t first) {
-        const std::vector<std::uint64_t> geometry{
-            m.lineage.value, d.id.value,       d.layout_version,
-            d.row_bytes,     d.rows_per_chunk, first,
-            p.bytes,         p.checksum,       d.window_rows};
-        auto [it, inserted] = claims.try_emplace(
-            {is_private, p.file}, Claim{m.compatibility, geometry, {}, false});
-        auto& value = it->second;
-        if (!inserted &&
-            (is_private || value.compatibility != m.compatibility ||
-             value.geometry != geometry))
-          value.conflict = true;
-        value.entries.push_back(i);
+      checkpoints[i] = i;
+      const auto claim = [&](bool is_private, const DiskPayload& p,
+                             const ComponentDescriptor& d, Rows first) {
+        const Claim current{&m, &d, &p, first};
+        auto [it, inserted] = claims.try_emplace({is_private, p.file}, current);
+        auto& previous = it->second;
+        if (!inserted && (is_private ||
+                          previous.manifest->compatibility != m.compatibility ||
+                          geometry(previous) != geometry(current)))
+          previous.conflict = true;
       };
       for (const auto& c : m.components) {
         Rows first = FirstChunkRow(c.descriptor, c.position.valid_rows);
@@ -748,19 +777,38 @@ struct DiskStore::Impl {
           claim(false, p, c.descriptor, first);
           first = Add(first, c.descriptor.rows_per_chunk);
         }
-        for (auto p : {c.tail, c.private_state})
-          if (p)
-            claim(true, *p, c.descriptor, first);
+        for (const auto* p : {&c.tail, &c.private_state})
+          if (*p)
+            claim(true, p->value(), c.descriptor, first);
       }
     }
-    for (const auto& [key, claim] : claims)
-      if (claim.conflict)
-        for (auto i : claim.entries)
-          rejected[i] = true;
-    for (const auto& [id, owners] : checkpoints)
-      if (owners.size() > 1)
-        for (auto i : owners)
-          rejected[i] = true;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      const auto conflict = [&](bool is_private, const DiskPayload& p) {
+        return claims.at({is_private, p.file}).conflict;
+      };
+      for (const auto& c : entries[i].manifest_.components) {
+        for (const auto& p : c.chunks)
+          rejected[i] |= conflict(false, p);
+        for (const auto* p : {&c.tail, &c.private_state})
+          if (*p)
+            rejected[i] |= conflict(true, p->value());
+      }
+    }
+    const auto checkpoint = [&](std::size_t i) {
+      return entries[i].manifest_.checkpoint.value;
+    };
+    std::sort(checkpoints.begin(), checkpoints.end(),
+              [&](auto a, auto b) { return checkpoint(a) < checkpoint(b); });
+    for (std::size_t first = 0; first < checkpoints.size();) {
+      auto end = first + 1;
+      while (end < checkpoints.size() &&
+             checkpoint(checkpoints[end]) == checkpoint(checkpoints[first]))
+        ++end;
+      if (end - first > 1)
+        for (auto i = first; i < end; ++i)
+          rejected[checkpoints[i]] = true;
+      first = end;
+    }
     std::size_t i{};
     std::erase_if(entries, [&](const auto&) {
       const bool remove = rejected[i++];
@@ -1538,6 +1586,28 @@ DiskStore::~DiskStore() = default;
 std::span<const DurableEntry> DiskStore::Entries() const {
   return impl_->entries;
 }
+std::size_t DiskStore::OwnedManifestBytes() const {
+  const std::lock_guard guard(impl_->index_mutex);
+  std::size_t owned{};
+  for (const auto& entry : impl_->entries) {
+    const auto& manifest = entry.manifest_;
+    auto bytes = Add(manifest.input.size(),
+                     Multiply(manifest.tokens.size(), sizeof(Token)));
+    bytes =
+        Add(bytes, Multiply(manifest.components.size(), sizeof(DiskComponent)));
+    for (const auto& component : manifest.components)
+      bytes =
+          Add(bytes, Multiply(component.chunks.size(), sizeof(DiskPayload)));
+    // Decode initialized these elements before converting their admission.
+    // A converted estimate elsewhere in the ledger proves no such backing.
+    if (!entry.metadata_ || bytes > entry.metadata_.Info().bytes)
+      throw std::logic_error("manifest storage exceeds retained charge");
+    if (bytes > std::numeric_limits<std::size_t>::max() - owned)
+      throw std::overflow_error("owned manifest storage overflows");
+    owned += bytes;
+  }
+  return owned;
+}
 DiskStartupStats DiskStore::Stats() const {
   std::lock_guard guard(impl_->stats_mutex);
   return impl_->stats;
@@ -1806,6 +1876,9 @@ void DiskStore::WaitForReclamation() {
     impl_->reclamation.get();
 }
 #ifdef GUFO_CACHE_TESTING
+void DiskStore::SetReferenceValidationHook(void (*hook)(bool) noexcept) {
+  reference_validation_hook = hook;
+}
 void DiskStore::SetCrashHook(std::function<void(DiskPublicationStep)> hook) {
   std::lock_guard guard(impl_->mutex);
   impl_->crash_hook = std::move(hook);

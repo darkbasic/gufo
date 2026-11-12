@@ -1,0 +1,269 @@
+{
+  "date": "2026-11-11",
+  "environment": {
+    "compiler": "GCC 15.3.0 (Ubuntu 15.3.0-4ubuntu1)",
+    "kernel": "Linux 7.3.0-10-generic",
+    "gpu_execution": false
+  },
+  "baseline_revision": "a0e0a5ea20d8cec9513471190d4cce57339f2861",
+  "candidate_revision": "uncommitted cache startup correction",
+  "measurement_scope": {
+    "logical": "ResourceLedger live/peak RAM charges, including reservations and estimates",
+    "cpp_heap": "ordinary operator new requested bytes; allocator headers, usable size and native malloc excluded",
+    "validation": "matched temporary source copies add entry/exit callbacks around production ValidateReferences",
+    "rss": "whole process maximum; includes fixture creation and profiler headers; not a validation-only RSS delta"
+  },
+  "limitations": [
+    "One instrumented run per revision/distribution; no timing qualification.",
+    "Sparse fixture references do not reproduce the owner manifest distribution.",
+    "Original harness preceded noinline attributes on replacement allocation functions; original observations are retained.",
+    "Fixture creation and recovery share a process and warm filesystem metadata; this is not a cold OS-cache benchmark."
+  ],
+  "instrumented_source_sha256": {
+    "before": "2e51064e640865ea8d6350b85054697a6ce400d5bfa321715b759baec30d97c8",
+    "after": "f436f9628999d162c117ae6a851b7df51d710065aa5a7f3ec01fb88a030eefd0"
+  },
+  "runs": [
+    {
+      "phase": "original_instrumented_harness",
+      "revision": "before",
+      "distribution": "unique",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-before-bench 16 512 4 0",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 8192,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 30.1966,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 2759424,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 2172841,
+        "cpp_allocations": 82938,
+        "validation_ms": 2.93953,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 1850704,
+        "validation_cpp_allocations": 33059
+      },
+      "process_max_rss_kib": 7304,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=8192 private_files=64 manifest_bytes_read=302080 startup_ms=30.1966 logical_live_bytes=314112 logical_peak_bytes=2759424 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=2172841 cpp_allocations=82938\nvalidation_ms=2.93953 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=1850704 validation_cpp_allocations=33059\n\tCommand being timed: \"/tmp/gufo-disk-recovery-before-bench 16 512 4 0\"\n\tUser time (seconds): 0.02\n\tSystem time (seconds): 0.11\n\tPercent of CPU this job got: 97%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7304\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 862\n\tVoluntary context switches: 3\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "original_instrumented_harness",
+      "revision": "before",
+      "distribution": "shared",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-before-bench 16 512 4 512",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 512,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 12.5037,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 2759424,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 513961,
+        "cpp_allocations": 61946,
+        "validation_ms": 0.856489,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 191824,
+        "validation_cpp_allocations": 19747
+      },
+      "process_max_rss_kib": 5060,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=512 private_files=64 manifest_bytes_read=302080 startup_ms=12.5037 logical_live_bytes=314112 logical_peak_bytes=2759424 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=513961 cpp_allocations=61946\nvalidation_ms=0.856489 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=191824 validation_cpp_allocations=19747\n\tCommand being timed: \"/tmp/gufo-disk-recovery-before-bench 16 512 4 512\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 96%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 5060\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 310\n\tVoluntary context switches: 1\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "original_instrumented_harness",
+      "revision": "after",
+      "distribution": "unique",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-after-bench 16 512 4 0",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 8192,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 27.4375,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 1313360,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 1114985,
+        "cpp_allocations": 58139,
+        "validation_ms": 2.15363,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 792848,
+        "validation_cpp_allocations": 8260
+      },
+      "process_max_rss_kib": 5556,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=8192 private_files=64 manifest_bytes_read=302080 startup_ms=27.4375 logical_live_bytes=314112 logical_peak_bytes=1313360 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=1114985 cpp_allocations=58139\nvalidation_ms=2.15363 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=792848 validation_cpp_allocations=8260\n\tCommand being timed: \"/tmp/gufo-disk-recovery-after-bench 16 512 4 0\"\n\tUser time (seconds): 0.02\n\tSystem time (seconds): 0.11\n\tPercent of CPU this job got: 97%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 5556\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 507\n\tVoluntary context switches: 1\n\tInvoluntary context switches: 7\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "original_instrumented_harness",
+      "revision": "after",
+      "distribution": "shared",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-after-bench 16 512 4 512",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 512,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 12.8965,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 1313360,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 377705,
+        "cpp_allocations": 42779,
+        "validation_ms": 0.708997,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 55568,
+        "validation_cpp_allocations": 580
+      },
+      "process_max_rss_kib": 4932,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=512 private_files=64 manifest_bytes_read=302080 startup_ms=12.8965 logical_live_bytes=314112 logical_peak_bytes=1313360 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=377705 cpp_allocations=42779\nvalidation_ms=0.708997 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=55568 validation_cpp_allocations=580\n\tCommand being timed: \"/tmp/gufo-disk-recovery-after-bench 16 512 4 512\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 92%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4932\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 270\n\tVoluntary context switches: 1\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "final_noinline_harness",
+      "revision": "before",
+      "distribution": "unique",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-before-bench.final 16 512 4 0",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 8192,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 27.0017,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 2759424,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 2172841,
+        "cpp_allocations": 82938,
+        "validation_ms": 2.58889,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 1850704,
+        "validation_cpp_allocations": 33059
+      },
+      "process_max_rss_kib": 7172,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=8192 private_files=64 manifest_bytes_read=302080 startup_ms=27.0017 logical_live_bytes=314112 logical_peak_bytes=2759424 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=2172841 cpp_allocations=82938\nvalidation_ms=2.58889 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=1850704 validation_cpp_allocations=33059\n\tCommand being timed: \"/tmp/gufo-disk-recovery-before-bench.final 16 512 4 0\"\n\tUser time (seconds): 0.02\n\tSystem time (seconds): 0.10\n\tPercent of CPU this job got: 86%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7172\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 860\n\tVoluntary context switches: 3\n\tInvoluntary context switches: 3\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "final_noinline_harness",
+      "revision": "before",
+      "distribution": "shared",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-before-bench.final 16 512 4 512",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 512,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 10.824,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 2759424,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 513961,
+        "cpp_allocations": 61946,
+        "validation_ms": 0.774838,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 191824,
+        "validation_cpp_allocations": 19747
+      },
+      "process_max_rss_kib": 5000,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=512 private_files=64 manifest_bytes_read=302080 startup_ms=10.824 logical_live_bytes=314112 logical_peak_bytes=2759424 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=513961 cpp_allocations=61946\nvalidation_ms=0.774838 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=191824 validation_cpp_allocations=19747\n\tCommand being timed: \"/tmp/gufo-disk-recovery-before-bench.final 16 512 4 512\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 55%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.03\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 5000\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 312\n\tVoluntary context switches: 2\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "final_noinline_harness",
+      "revision": "after",
+      "distribution": "unique",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-after-bench.final 16 512 4 0",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 8192,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 24.6974,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 1313360,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 1114985,
+        "cpp_allocations": 58139,
+        "validation_ms": 1.96731,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 792848,
+        "validation_cpp_allocations": 8260
+      },
+      "process_max_rss_kib": 5512,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=8192 private_files=64 manifest_bytes_read=302080 startup_ms=24.6974 logical_live_bytes=314112 logical_peak_bytes=1313360 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=1114985 cpp_allocations=58139\nvalidation_ms=1.96731 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=792848 validation_cpp_allocations=8260\n\tCommand being timed: \"/tmp/gufo-disk-recovery-after-bench.final 16 512 4 0\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.11\n\tPercent of CPU this job got: 97%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.12\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 5512\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 506\n\tVoluntary context switches: 1\n\tInvoluntary context switches: 7\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    },
+    {
+      "phase": "final_noinline_harness",
+      "revision": "after",
+      "distribution": "shared",
+      "command": "/usr/bin/time -v /tmp/gufo-disk-recovery-after-bench.final 16 512 4 512",
+      "metrics": {
+        "manifests": 16,
+        "references": 8256,
+        "unique_chunks": 512,
+        "private_files": 64,
+        "manifest_bytes_read": 302080,
+        "startup_ms": 10.8022,
+        "logical_live_bytes": 314112,
+        "logical_peak_bytes": 1313360,
+        "cpp_heap_live_bytes": 322137,
+        "cpp_heap_peak_bytes": 377705,
+        "cpp_allocations": 42779,
+        "validation_ms": 0.619141,
+        "validation_cpp_live_bytes": 0,
+        "validation_cpp_peak_bytes": 55568,
+        "validation_cpp_allocations": 580
+      },
+      "process_max_rss_kib": 4944,
+      "exit_status": 0,
+      "raw_log": "manifests=16 references=8256 unique_chunks=512 private_files=64 manifest_bytes_read=302080 startup_ms=10.8022 logical_live_bytes=314112 logical_peak_bytes=1313360 cpp_heap_live_bytes=322137 cpp_heap_peak_bytes=377705 cpp_allocations=42779\nvalidation_ms=0.619141 validation_cpp_live_bytes=0 validation_cpp_peak_bytes=55568 validation_cpp_allocations=580\n\tCommand being timed: \"/tmp/gufo-disk-recovery-after-bench.final 16 512 4 512\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 91%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4944\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 270\n\tVoluntary context switches: 2\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+    }
+  ],
+  "final_instrumented_source_sha256": {
+    "before": "2e51064e640865ea8d6350b85054697a6ce400d5bfa321715b759baec30d97c8",
+    "after": "41431efc6e621cac390df29c88412b353945016b3f024aaf3c601047e0d2769d"
+  },
+  "final_harness_sha256": "908e48c4bfa77516a5b2c3ca744adbb0926dd370fb9a06c56fed30f7f95a1607",
+  "final_compile_commands": [
+    "c++ -std=c++20 -O2 -g -UNDEBUG -DGUFO_CACHE_TESTING -pthread -I. -Iinclude tests/cache/disk_startup_bench.cpp /tmp/gufo-disk-recovery-before-measured.final.cpp -Wl,--start-group build/cpu-test/src/cache/libgufo_cache.a build/cpu-test/src/core/platform/libgufo_platform.a -Wl,--end-group -ldl -o /tmp/gufo-disk-recovery-before-bench.final",
+    "c++ -std=c++20 -O2 -g -UNDEBUG -DGUFO_CACHE_TESTING -pthread -I. -Iinclude tests/cache/disk_startup_bench.cpp /tmp/gufo-disk-recovery-after-measured.final.cpp -Wl,--start-group build/cpu-test/src/cache/libgufo_cache.a build/cpu-test/src/core/platform/libgufo_platform.a -Wl,--end-group -ldl -o /tmp/gufo-disk-recovery-after-bench.final"
+  ],
+  "normal_cmake_benchmark": {
+    "command": "/usr/bin/time -v build/cpu-test/tests/cache/cache_disk_startup_bench",
+    "metrics": {
+      "manifests": 8,
+      "references": 544,
+      "unique_chunks": 288,
+      "private_files": 32,
+      "manifest_bytes_read": 22016,
+      "startup_ms": 2.07534,
+      "logical_live_bytes": 28416,
+      "logical_peak_bytes": 94440,
+      "cpp_heap_live_bytes": 33625,
+      "cpp_heap_peak_bytes": 64545,
+      "cpp_allocations": 3555
+    },
+    "process_max_rss_kib": 4600,
+    "exit_status": 0,
+    "raw_log": "manifests=8 references=544 unique_chunks=288 private_files=32 manifest_bytes_read=22016 startup_ms=2.07534 logical_live_bytes=28416 logical_peak_bytes=94440 cpp_heap_live_bytes=33625 cpp_heap_peak_bytes=64545 cpp_allocations=3555\n\tCommand being timed: \"build/cpu-test/tests/cache/cache_disk_startup_bench\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.00\n\tPercent of CPU this job got: 10%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.08\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4600\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 194\n\tVoluntary context switches: 2\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 0\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n",
+    "oversize_input": {
+      "command": "build/cpu-test/tests/cache/cache_disk_startup_bench 1000 60000 255 0",
+      "exit_status": 2,
+      "reason": "aggregate limit"
+    }
+  }
+}

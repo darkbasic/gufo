@@ -225,6 +225,11 @@ public:
   DiskStore(DiskStore&&) = delete;
   DiskStore& operator=(DiskStore&&) = delete;
   [[nodiscard]] std::span<const DurableEntry> Entries() const;
+  // Initialized, retained manifest vector storage included in the RAM ledger.
+  // For startup remaining-allocation accounting, not an RSS measurement.
+  // Excludes spare capacity, owner/index estimates, temporary validation,
+  // payloads and reservations. Use at quiescence with the host observation.
+  [[nodiscard]] std::size_t OwnedManifestBytes() const;
   [[nodiscard]] DiskStartupStats Stats() const;
   [[nodiscard]] DiskPublicationStats PublicationStats() const;
   void Publish(DiskFileId manifest_file, const DiskManifest&,
@@ -266,6 +271,9 @@ public:
   void WaitForReclamation();
 #ifdef GUFO_CACHE_TESTING
   void SetCrashHook(std::function<void(DiskPublicationStep)>);
+  // Current-thread scope around reference validation, after filesystem
+  // discovery. Both notifications are nonthrowing, including during unwind.
+  static void SetReferenceValidationHook(void (*)(bool entering) noexcept);
 #endif
 
 private:

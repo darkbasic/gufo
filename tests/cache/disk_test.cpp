@@ -8,15 +8,19 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <new>
 
 using namespace gufo::cache;
 namespace fs = std::filesystem;
 namespace {
 std::atomic<std::uint64_t> actual_manifest_bytes{}, actual_payload_bytes{};
 std::atomic<bool> interrupt_next_read{}, shorten_reads{};
+thread_local std::int64_t fail_allocation_after{-1};
+thread_local std::int64_t validation_failure_after{-1};
 void CountRead(int fd, ssize_t bytes) {
   if (bytes <= 0)
     return;
@@ -33,6 +37,19 @@ void CountRead(int fd, ssize_t bytes) {
     actual_payload_bytes += bytes;
 }
 }  // namespace
+[[gnu::noinline]] void* operator new(std::size_t bytes) {
+  if (fail_allocation_after >= 0 && fail_allocation_after-- == 0)
+    throw std::bad_alloc();
+  if (auto* memory = std::malloc(bytes ? bytes : 1))
+    return memory;
+  throw std::bad_alloc();
+}
+[[gnu::noinline]] void operator delete(void* memory) noexcept {
+  std::free(memory);
+}
+[[gnu::noinline]] void operator delete(void* memory, std::size_t) noexcept {
+  std::free(memory);
+}
 extern "C" ssize_t __real_read(int, void*, size_t);
 extern "C" ssize_t __wrap_read(int fd, void* buffer, size_t size) {
   if (interrupt_next_read.exchange(false)) {
@@ -86,6 +103,13 @@ DiskManifest Manifest() {
                           {},
                           DiskPayload{Id(3), 16, 101}});
   return m;
+}
+std::size_t ManifestStorage(const DiskManifest& m) {
+  auto bytes = m.input.size() + m.tokens.size() * sizeof(Token) +
+               m.components.size() * sizeof(DiskComponent);
+  for (const auto& c : m.components)
+    bytes += c.chunks.size() * sizeof(DiskPayload);
+  return bytes;
 }
 void Write(const fs::path& p, std::span<const std::uint8_t> bytes) {
   std::ofstream f(p, std::ios::binary);
@@ -290,6 +314,7 @@ void Index() {
   Directory d;
   {
     DiskStore init(ledger, d.path, UINT64_MAX);
+    assert(init.OwnedManifestBytes() == 0);
   }
   auto m = Manifest();
   Payloads(d.path, m);
@@ -306,6 +331,12 @@ void Index() {
     assert(store.Stats().dependency_stats == 3);
     assert(actual_manifest_bytes == encoded_size && actual_payload_bytes == 0);
     assert(store.Stats().managed_bytes == encoded_size + 28);
+    assert(store.OwnedManifestBytes() == ManifestStorage(m));
+    // Logical estimates and pending allocations do not establish owned bytes.
+    const auto pending = ledger.Reserve(ResourceCategory::kMetadata, 8192);
+    const auto estimated =
+        ledger.Reserve(ResourceCategory::kMetadata, 16384).Convert();
+    assert(store.OwnedManifestBytes() == ManifestStorage(m));
   }
   // Sparse files scale declared payload by 1 GiB, without increasing metadata
   // or startup reads. Their contents deliberately fail the declared CRCs.
@@ -324,6 +355,8 @@ void Index() {
   {
     DiskStore store(ledger, d.path, UINT64_MAX);
     assert(store.Entries().empty() && store.Stats().rejected_manifests == 1);
+    // The retained entry-table capacity and its charge are not manifest data.
+    assert(ledger.Snapshot().ram_bytes && store.OwnedManifestBytes() == 0);
   }
   Payloads(d.path, m);
   auto dependency = d.path / "v2/private" / DiskFileName(Id(3));
@@ -383,6 +416,82 @@ void Conflicts() {
   {
     DiskStore store(ledger, d.path, UINT64_MAX);
     assert(store.Entries().empty());
+  }
+}
+void AllConflictOwners() {
+  // Three owners share a claim, including two agreeing owners and an outlier.
+  // Every side must be rejected, even if the outlier is visited first/last.
+  for (unsigned conflict = 0; conflict < 4; ++conflict) {
+    Directory d;
+    {
+      DiskStore init(ledger, d.path, UINT64_MAX);
+    }
+    std::array<DiskManifest, 4> manifests;
+    for (unsigned i = 0; i < manifests.size(); ++i) {
+      auto& m = manifests[i];
+      m = Manifest();
+      m.checkpoint = {7 + i};
+      m.components[0].tail->file = Id(20 + i);
+      m.components[1].private_state->file = Id(30 + i);
+      if (i == 3 || conflict >= 2)
+        m.components[0].chunks[0].file = Id(40 + i);
+    }
+    if (conflict == 0)
+      ++manifests[2].components[0].chunks[0].checksum;
+    if (conflict == 1)
+      ++manifests[2].compatibility[0];
+    if (conflict == 2)
+      for (unsigned i = 0; i < 3; ++i)
+        manifests[i].components[1].private_state->file = Id(30);
+    if (conflict == 3)
+      for (unsigned i = 0; i < 3; ++i)
+        manifests[i].checkpoint = {7};
+    for (const auto& m : manifests)
+      Payloads(d.path, m);
+    std::array<unsigned, 4> order{0, 1, 2, 3};
+    do {
+      // Reassign contents to filenames, exercising every enumeration order
+      // without relying on a particular filesystem's directory ordering.
+      for (unsigned i = 0; i < order.size(); ++i)
+        Put(d.path, manifests[order[i]], 100 + i);
+      actual_manifest_bytes = actual_payload_bytes = 0;
+      {
+        DiskStore store(ledger, d.path, UINT64_MAX);
+        assert(store.Entries().size() == 1);
+        assert(store.Entries().front().Manifest().checkpoint.value == 10);
+        assert(store.Stats().rejected_manifests == 3);
+        assert(actual_manifest_bytes && actual_payload_bytes == 0);
+        assert(store.OwnedManifestBytes() == ManifestStorage(manifests[3]));
+      }
+      assert(ledger.Snapshot().total_bytes == 0);
+    } while (std::next_permutation(order.begin(), order.end()));
+  }
+}
+void MissingDependenciesAndRestart() {
+  Directory d;
+  auto m = Manifest();
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  Put(d.path, m);
+  for (unsigned failure = 0; failure < 3; ++failure) {
+    Payloads(d.path, m);
+    if (failure == 0)
+      fs::remove(d.path / "v2/chunks" / DiskFileName(Id(1)));
+    if (failure == 1)
+      fs::remove(d.path / "v2/private" / DiskFileName(Id(3)));
+    if (failure == 2)
+      fs::resize_file(d.path / "v2/private" / DiskFileName(Id(3)), 15);
+    {
+      DiskStore rejected(ledger, d.path, UINT64_MAX);
+      assert(rejected.Entries().empty());
+      assert(rejected.Stats().rejected_manifests == 1);
+      assert(rejected.OwnedManifestBytes() == 0);
+    }
+    Payloads(d.path, m);
+    DiskStore restored(ledger, d.path, UINT64_MAX);
+    assert(restored.Entries().size() == 1);
+    assert(restored.OwnedManifestBytes() == ManifestStorage(m));
   }
 }
 void RootSymlinks() {
@@ -455,6 +564,34 @@ void MetadataAdmission() {
     }
     assert(succeeded);
   }
+  // Walk actual reference-validation allocations, including ledger tokens,
+  // nodes and arrays. Keep injection out of unrelated noexcept filesystem
+  // wrappers. Whole-construction ledger faults remain covered above.
+  DiskStore::SetReferenceValidationHook([](bool entering) noexcept {
+    fail_allocation_after = entering ? validation_failure_after : -1;
+  });
+  bool allocated = false;
+  for (std::int64_t n = 0; n < 512; ++n) {
+    ResourceLedger faults{{1 << 20, 1 << 20, 0, 0}};
+    validation_failure_after = n;
+    try {
+      DiskStore store(faults, d.path, UINT64_MAX);
+      assert(store.Entries().size() == 1);
+      allocated = true;
+    } catch (const std::bad_alloc&) {
+    }
+    assert(fail_allocation_after == -1);
+    validation_failure_after = -1;
+    assert(faults.Snapshot().total_bytes == 0);
+    {
+      DiskStore reopened(ledger, d.path, UINT64_MAX);
+      assert(reopened.Entries().size() == 1);
+    }
+    if (allocated)
+      break;
+  }
+  DiskStore::SetReferenceValidationHook(nullptr);
+  assert(allocated);
   // Structurally rejected entries retain no decoded-vector charge.
   fs::resize_file(d.path / "v2/chunks" / DiskFileName(Id(1)), 7);
   {
@@ -810,6 +947,8 @@ int main() {
   Ownership();
   Index();
   Conflicts();
+  AllConflictOwners();
+  MissingDependenciesAndRestart();
   BudgetAndDirectories();
   CapacityBeforePayloadReads();
   VerifiedDependencies();
